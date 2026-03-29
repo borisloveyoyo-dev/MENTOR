@@ -13,6 +13,7 @@ from bot.keyboards import (
     get_payment_keyboard,
     get_start_onboarding_keyboard,
 )
+from bot.stickers import get_random_sticker_file_id
 from bot.texts import (
     DEFAULT_REPLY_TEXT,
     DIRECTION_CHOICE_TEXT,
@@ -66,6 +67,31 @@ def random_next_followup_at() -> datetime:
         hours=random.randint(6, 12),
         minutes=random.randint(0, 59),
     )
+
+
+async def send_optional_sticker(message: Message, pack_name: str) -> None:
+    sticker_id = get_random_sticker_file_id(pack_name)
+    if not sticker_id:
+        return
+
+    try:
+        await message.answer_sticker(sticker_id)
+    except Exception:
+        pass
+
+
+async def send_optional_sticker_callback(callback: CallbackQuery, pack_name: str) -> None:
+    if callback.message is None:
+        return
+
+    sticker_id = get_random_sticker_file_id(pack_name)
+    if not sticker_id:
+        return
+
+    try:
+        await callback.message.answer_sticker(sticker_id)
+    except Exception:
+        pass
 
 
 async def get_or_create_user(message: Message) -> User | None:
@@ -270,11 +296,13 @@ async def send_payment_required_message(message: Message, user_id: int) -> None:
     try:
         payment_url = await create_month_payment_for_user(user_id)
     except PaymentServiceError:
+        await send_optional_sticker(message, "error_soft")
         await message.answer(
             "С оплатой сейчас не получилось.\n\nПопробуй еще раз чуть позже."
         )
         return
     except Exception:
+        await send_optional_sticker(message, "error_soft")
         await message.answer(
             "Я сейчас споткнулся на создании оплаты.\n\nПопробуй еще раз чуть позже."
         )
@@ -294,12 +322,14 @@ async def send_payment_required_callback(callback: CallbackQuery, user_id: int) 
     try:
         payment_url = await create_month_payment_for_user(user_id)
     except PaymentServiceError:
+        await send_optional_sticker_callback(callback, "error_soft")
         await callback.message.answer(
             "С оплатой сейчас не получилось.\n\nПопробуй еще раз чуть позже."
         )
         await callback.answer()
         return
     except Exception:
+        await send_optional_sticker_callback(callback, "error_soft")
         await callback.message.answer(
             "Я сейчас споткнулся на создании оплаты.\n\nПопробуй еще раз чуть позже."
         )
@@ -335,6 +365,7 @@ async def show_or_generate_directions(message: Message, user: User) -> None:
     directions = await get_saved_profile_directions(user.id)
 
     if directions:
+        await send_optional_sticker(message, "direction_found")
         await message.answer("Я уже собрал тебе варианты.")
         await message.answer(
             DIRECTION_CHOICE_TEXT,
@@ -342,6 +373,7 @@ async def show_or_generate_directions(message: Message, user: User) -> None:
         )
         return
 
+    await send_optional_sticker(message, "thinking")
     await message.answer("Сейчас быстро посмотрю, куда тебе лучше зайти сначала.")
 
     try:
@@ -352,17 +384,20 @@ async def show_or_generate_directions(message: Message, user: User) -> None:
         ):
             analysis_text, directions = await analyze_user_profile_and_save(user.id)
 
+        await send_optional_sticker(message, "direction_found")
         await message.answer(analysis_text)
         await message.answer(
             DIRECTION_CHOICE_TEXT,
             reply_markup=get_direction_choice_keyboard(directions),
         )
     except (AIServiceError, MentorServiceError):
+        await send_optional_sticker(message, "error_soft")
         await message.answer(
             "Профиль у меня есть.\n\n"
             "С вариантами сейчас не получилось. Попробуй еще раз через /start."
         )
     except Exception:
+        await send_optional_sticker(message, "error_soft")
         await message.answer(
             "Я сейчас споткнулся на подборе направлений.\n\n"
             "Попробуй еще раз через /start."
@@ -397,6 +432,7 @@ async def cmd_start(message: Message) -> None:
         await show_or_generate_directions(message, user)
         return
 
+    await send_optional_sticker(message, "welcome")
     await message.answer(
         WELCOME_TEXT,
         reply_markup=get_start_onboarding_keyboard(),
@@ -420,6 +456,7 @@ async def onboarding_start(callback: CallbackQuery) -> None:
     )
 
     if callback.message is not None:
+        await send_optional_sticker_callback(callback, "onboarding_start")
         await callback.message.edit_text(ONBOARDING_Q1_TEXT)
 
     await callback.answer()
@@ -494,6 +531,7 @@ async def direction_choose(callback: CallbackQuery) -> None:
         return
 
     await callback.message.edit_reply_markup(reply_markup=None)
+    await send_optional_sticker_callback(callback, "direction_chosen")
     await callback.message.answer(
         DIRECTION_CHOSEN_TEXT_TEMPLATE.format(direction=chosen_title)
     )
@@ -510,6 +548,7 @@ async def direction_choose(callback: CallbackQuery) -> None:
         ):
             first_task = await generate_first_task_for_user(user.id)
 
+        await send_optional_sticker_callback(callback, "first_step")
         await callback.message.answer(
             FIRST_STEP_TITLE_TEMPLATE.format(task_title=first_task["task_title"])
         )
@@ -547,11 +586,13 @@ async def direction_choose(callback: CallbackQuery) -> None:
             )
         )
     except (AIServiceError, MentorServiceError):
+        await send_optional_sticker_callback(callback, "error_soft")
         await callback.message.answer(
             "Выбор сохранил.\n\n"
             "С первым шагом сейчас не получилось. Но направление уже на месте."
         )
     except Exception:
+        await send_optional_sticker_callback(callback, "error_soft")
         await callback.message.answer(
             "Выбор сохранил.\n\n"
             "На первом шаге я сейчас споткнулся. Но сам выбор не потерян."
@@ -676,9 +717,18 @@ async def handle_any_message(message: Message) -> None:
                 burnout_flag=detected_state["burnout_flag"],
             )
 
+            state_code = detected_state["state_code"]
+
+            if state_code in {"burnout", "exhausted", "overwhelmed"}:
+                await send_optional_sticker(message, "burnout_soft")
+            elif state_code in {"progress", "done", "small_progress"}:
+                await send_optional_sticker(message, "progress_small")
+            elif state_code in {"good_progress", "result"}:
+                await send_optional_sticker(message, "progress_good")
+
             task_title = await get_latest_pending_task_title(user.id)
             reply_text = build_state_reply(
-                detected_state["state_code"],
+                state_code,
                 task_title,
             )
             await message.answer(reply_text)
