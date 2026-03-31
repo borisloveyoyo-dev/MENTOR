@@ -26,6 +26,7 @@ from bot.texts import (
     ONBOARDING_ABOUT_TEXT,
     ONBOARDING_ALREADY_STARTED_TEXT,
     ONBOARDING_FINISH_TEXT,
+    ONBOARDING_NAME_TEXT,
     ONBOARDING_Q1_TEXT,
     ONBOARDING_Q2_TEXT,
     ONBOARDING_Q3_TEXT,
@@ -67,6 +68,29 @@ def random_next_followup_at() -> datetime:
         hours=random.randint(6, 12),
         minutes=random.randint(0, 59),
     )
+
+
+def normalize_name(text: str) -> str:
+    cleaned = " ".join((text or "").strip().split())
+    return cleaned[:32]
+
+
+def get_display_name(user: User | None) -> str:
+    if user is None:
+        return ""
+
+    name = (user.first_name or "").strip()
+    return name
+
+
+def build_action_push() -> str:
+    variants = [
+        "А теперь не задаемся вопросами и начинаем делать.",
+        "Все. Хватит крутить это в голове. Начинаем делать.",
+        "Не зависаем. Просто заходим в действие.",
+        "Идем руками, не размышлениями.",
+    ]
+    return random.choice(variants)
 
 
 async def send_optional_sticker(message: Message, pack_name: str) -> None:
@@ -116,8 +140,11 @@ async def get_or_create_user(message: Message) -> User | None:
             await session.flush()
         else:
             user.username = message.from_user.username
-            user.first_name = message.from_user.first_name
             user.last_name = message.from_user.last_name
+
+            if not (user.first_name or "").strip():
+                user.first_name = message.from_user.first_name
+
             user.last_user_message_at = utcnow()
             user.updated_at = utcnow()
 
@@ -184,6 +211,21 @@ async def update_profile_fields(user_id: int, **fields) -> None:
             setattr(profile, field_name, field_value)
 
         profile.updated_at = utcnow()
+        await session.commit()
+
+
+async def update_user_display_name(user_id: int, display_name: str) -> None:
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(User).where(User.id == user_id)
+        )
+        user = result.scalar_one_or_none()
+
+        if user is None:
+            return
+
+        user.first_name = display_name
+        user.updated_at = utcnow()
         await session.commit()
 
 
@@ -423,10 +465,17 @@ async def cmd_start(message: Message) -> None:
                 await send_payment_required_message(message, user.id)
                 return
 
-            await message.answer(
-                "С возвращением.\n\n"
-                f"Мы с тобой идем в сторону: {user.selected_direction}"
-            )
+            display_name = get_display_name(user)
+            if display_name:
+                await message.answer(
+                    f"С возвращением, {display_name}.\n\n"
+                    f"Мы с тобой идем в сторону: {user.selected_direction}"
+                )
+            else:
+                await message.answer(
+                    "С возвращением.\n\n"
+                    f"Мы с тобой идем в сторону: {user.selected_direction}"
+                )
             return
 
         await show_or_generate_directions(message, user)
@@ -452,12 +501,12 @@ async def onboarding_start(callback: CallbackQuery) -> None:
 
     await update_profile_fields(
         user_id=user.id,
-        onboarding_step="q1_income",
+        onboarding_step="q0_name",
     )
 
     if callback.message is not None:
         await send_optional_sticker_callback(callback, "onboarding_start")
-        await callback.message.edit_text(ONBOARDING_Q1_TEXT)
+        await callback.message.edit_text(ONBOARDING_NAME_TEXT)
 
     await callback.answer()
 
@@ -530,15 +579,22 @@ async def direction_choose(callback: CallbackQuery) -> None:
         await callback.answer("Выбор сохранен")
         return
 
+    display_name = get_display_name(user)
+
     await callback.message.edit_reply_markup(reply_markup=None)
     await send_optional_sticker_callback(callback, "direction_chosen")
+
+    if display_name:
+        await callback.message.answer(f"Хорошо, {display_name}.")
+    else:
+        await callback.message.answer("Хорошо.")
+
     await callback.message.answer(
         DIRECTION_CHOSEN_TEXT_TEMPLATE.format(direction=chosen_title)
     )
     await callback.message.answer(
         f"Почему это может тебе зайти:\n\n{chosen_description}"
     )
-    await callback.message.answer(FIRST_STEP_INTRO_TEXT)
 
     try:
         async with ChatActionSender(
@@ -547,6 +603,11 @@ async def direction_choose(callback: CallbackQuery) -> None:
             action=ChatAction.TYPING,
         ):
             first_task = await generate_first_task_for_user(user.id)
+
+        if first_task.get("short_perspective"):
+            await callback.message.answer(first_task["short_perspective"])
+
+        await callback.message.answer(FIRST_STEP_INTRO_TEXT)
 
         await send_optional_sticker_callback(callback, "first_step")
         await callback.message.answer(
@@ -585,6 +646,7 @@ async def direction_choose(callback: CallbackQuery) -> None:
                 success_criteria=first_task["success_criteria"]
             )
         )
+        await callback.message.answer(build_action_push())
     except (AIServiceError, MentorServiceError):
         await send_optional_sticker_callback(callback, "error_soft")
         await callback.message.answer(
@@ -616,6 +678,25 @@ async def handle_any_message(message: Message) -> None:
     await touch_user_activity(user.id)
 
     text = (message.text or "").strip()
+
+    if profile.onboarding_step == "q0_name":
+        if not is_meaningful_text(text):
+            await message.answer("Напиши коротко, как к тебе обращаться.")
+            return
+
+        display_name = normalize_name(text)
+        if len(display_name) < 2:
+            await message.answer("Давай чуть понятнее. Хотя бы 2 символа.")
+            return
+
+        await update_user_display_name(user.id, display_name)
+        await update_profile_fields(
+            user_id=user.id,
+            onboarding_step="q1_income",
+        )
+        await message.answer(f"Отлично, {display_name}.")
+        await message.answer(ONBOARDING_Q1_TEXT)
+        return
 
     if profile.onboarding_step == "q1_income":
         if not is_meaningful_text(text):
@@ -692,6 +773,7 @@ async def handle_any_message(message: Message) -> None:
         )
         await mark_onboarding_completed(user.id)
 
+        await message.answer(ONBOARDING_FINISH_TEXT)
         await message.answer(
             "Онбординг сохранил.\n\n"
             "Дальше уже работаем по подписке."

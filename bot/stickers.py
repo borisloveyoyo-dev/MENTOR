@@ -13,9 +13,9 @@ STICKERS: dict[str, list[dict[str, str]]] = {
         },
         {
             "key": "welcome_2",
-            "file_id": "",
-            "file_unique_id": "",
-            "note": "Доп. вариант этого же сценария",
+            "file_id": "AAMCAgADGQEAAUXyzGnJVCy-6gL9qOwq09O5NkBV5lwCAAJnlAACuz-ASwU5b3oIsO_KAQAHbQADOgQ",
+            "file_unique_id": "AQADZ5QAArs_gEty",
+            "note": "Доп. вариант приветствия",
         },
     ],
     "onboarding_start": [
@@ -27,9 +27,9 @@ STICKERS: dict[str, list[dict[str, str]]] = {
         },
         {
             "key": "onboarding_start_2",
-            "file_id": "",
-            "file_unique_id": "",
-            "note": "Доп. вариант этого же сценария",
+            "file_id": "AAMCAgADGQEAAUXy0WnJVDjKumMbOWfBjAeqZfQVeJP-AALmkwACx_f4SZwRIe4D-XVdAQAHbQADOgQ",
+            "file_unique_id": "AQAD5pMAAsf3-Ely",
+            "note": "Доп. вариант начала онбординга",
         },
     ],
     "thinking": [
@@ -49,14 +49,14 @@ STICKERS: dict[str, list[dict[str, str]]] = {
     "direction_found": [
         {
             "key": "direction_found_1",
-            "file_id": "",
-            "file_unique_id": "",
+            "file_id": "AAMCAgADGQEAAUXyvWnJU9bDWEwv_jG-Ay6JPDNAUYraAALnjwACLi9hSarg4tuh3IigAQAHbQADOgQ",
+            "file_unique_id": "AQAD548AAi4vYUly",
             "note": "Нашли направления",
         },
         {
             "key": "direction_found_2",
-            "file_id": "",
-            "file_unique_id": "",
+            "file_id": "AAMCAgADGQEAAUXywmnJU_q_khpNk6osUID48dtUD1D4AAJKogACrR6BS6bp-tn1YDnVAQAHbQADOgQ",
+            "file_unique_id": "AQADSqIAAq0egUty",
             "note": "Доп. вариант этого же сценария",
         },
     ],
@@ -77,14 +77,14 @@ STICKERS: dict[str, list[dict[str, str]]] = {
     "first_step": [
         {
             "key": "first_step_1",
-            "file_id": "",
-            "file_unique_id": "",
+            "file_id": "AAMCAgADGQEAAUXzaGnJWaw4OzR75ONTkxXc41UhEK0eAAI5kAACtX-AS5Z4kRONfDRDAQAHbQADOgQ",
+            "file_unique_id": "AQADOZAAArV_gEty",
             "note": "Выдали первый шаг",
         },
         {
             "key": "first_step_2",
-            "file_id": "",
-            "file_unique_id": "",
+            "file_id": "AAMCAgADGQEAAUXyyGnJVA8RtwvxmiWRZRR82V_ONjoHAALKAAPfIewHyqIdwqu5YlkBAAdtAAM6BA",
+            "file_unique_id": "AQADygAD3yHsB3I",
             "note": "Доп. вариант этого же сценария",
         },
     ],
@@ -111,8 +111,8 @@ STICKERS: dict[str, list[dict[str, str]]] = {
         },
         {
             "key": "progress_good_2",
-            "file_id": "",
-            "file_unique_id": "",
+            "file_id": "AAMCAgADGQEAAUXyyGnJVA8RtwvxmiWRZRR82V_ONjoHAALKAAPfIewHyqIdwqu5YlkBAAdtAAM6BA",
+            "file_unique_id": "AQADygAD3yHsB3I",
             "note": "Доп. вариант этого же сценария",
         },
     ],
@@ -133,14 +133,14 @@ STICKERS: dict[str, list[dict[str, str]]] = {
     "followup_live": [
         {
             "key": "followup_live_1",
-            "file_id": "",
-            "file_unique_id": "",
+            "file_id": "AAMCAgADGQEAAUXzaGnJWaw4OzR75ONTkxXc41UhEK0eAAI5kAACtX-AS5Z4kRONfDRDAQAHbQADOgQ",
+            "file_unique_id": "AQADOZAAArV_gEty",
             "note": "Живой follow-up",
         },
         {
             "key": "followup_live_2",
-            "file_id": "",
-            "file_unique_id": "",
+            "file_id": "AAMCAgADGQEAAUXyxmnJVAuaDV1dfNgKHMYLstJjvBxGAALHAAPfIewHGfm3hhqvDoMBAAdtAAM6BA",
+            "file_unique_id": "AQADxwAD3yHsB3I",
             "note": "Доп. вариант этого же сценария",
         },
     ],
@@ -153,8 +153,8 @@ STICKERS: dict[str, list[dict[str, str]]] = {
         },
         {
             "key": "push_soft_2",
-            "file_id": "",
-            "file_unique_id": "",
+            "file_id": "AAMCAgADGQEAAUXyyGnJVA8RtwvxmiWRZRR82V_ONjoHAALKAAPfIewHyqIdwqu5YlkBAAdtAAM6BA",
+            "file_unique_id": "AQADygAD3yHsB3I",
             "note": "Доп. вариант этого же сценария",
         },
     ],
@@ -220,13 +220,4 @@ def get_sticker_file_id_by_key(sticker_key: str) -> str | None:
     sticker = get_sticker_by_key(sticker_key)
     if sticker is None:
         return None
-    file_id = (sticker.get("file_id") or "").strip()
-    return file_id or None
-
-
-def get_sticker_unique_id_by_key(sticker_key: str) -> str | None:
-    sticker = get_sticker_by_key(sticker_key)
-    if sticker is None:
-        return None
-    unique_id = (sticker.get("file_unique_id") or "").strip()
-    return unique_id or None
+    return sticker.get("file_id") or None

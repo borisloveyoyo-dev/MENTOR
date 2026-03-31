@@ -22,6 +22,7 @@ class ProfileAnalysisResult:
 @dataclass
 class FirstStepPlanResult:
     step_title: str
+    short_perspective: str
     step_description: str
     why_this_step: str
     how_to_do_it: list[str]
@@ -122,6 +123,7 @@ class AIService:
 
         return FirstStepPlanResult(
             step_title=self._normalize_required_string(parsed, "step_title"),
+            short_perspective=self._normalize_required_string(parsed, "short_perspective"),
             step_description=self._normalize_required_string(parsed, "step_description"),
             why_this_step=self._normalize_required_string(parsed, "why_this_step"),
             how_to_do_it=self._normalize_required_string_list(parsed, "how_to_do_it", limit=5),
@@ -278,6 +280,15 @@ class AIService:
 - не толкай человека в заработок на первом шаге;
 - не советуй опасные, незаконные или сомнительные вещи.
 
+Дополнительно нужен короткий блок short_perspective:
+- это перспектива на ближайшие 5-7 дней, если человек будет держать ритм;
+- там должен быть реальный, наблюдаемый, прикладной результат;
+- формулировка должна быть живой и весомой, но реалистичной;
+- можно очень мягко намекнуть, что этому уже можно искать практическое применение;
+- нельзя обещать деньги, клиентов, заказы, профессию или быстрый заработок;
+- нельзя звучать как продавец успеха;
+- нельзя писать пафосно или абстрактно.
+
 Главный принцип:
 первый шаг должен выглядеть так, будто живой наставник сидит рядом и ведет человека за руку.
 Не давай указания уровня "сделай монтаж", "собери карточки", "оформи концепт".
@@ -309,6 +320,7 @@ class AIService:
 Формат:
 {{
   "step_title": "Очень короткое название шага, 2-5 слов",
+  "short_perspective": "1-2 коротких предложения про ближайшие 5-7 дней: реальный результат и очень мягкий намек, что этому уже можно искать практическое применение.",
   "step_description": "Коротко и очень понятно: что человек делает сейчас. Без абстракции и без жаргона.",
   "why_this_step": "Коротко объясни, почему начинаем именно так. По-человечески и без пафоса.",
   "how_to_do_it": [
@@ -326,6 +338,11 @@ class AIService:
 
 Жесткие правила к ответу:
 - step_title: короткий и конкретный;
+- short_perspective: 1-2 коротких предложения;
+- short_perspective должна описывать только ближайшие 5-7 дней;
+- short_perspective должна давать реальный маленький, но весомый результат;
+- в short_perspective допустим только мягкий намек в духе "этому уже можно искать практическое применение";
+- short_perspective не должна обещать заработок, продажу, клиентов, монетизацию или успех;
 - step_description: 1-2 коротких предложения;
 - why_this_step: 1-2 коротких предложения;
 - how_to_do_it: от 3 до 5 шагов;

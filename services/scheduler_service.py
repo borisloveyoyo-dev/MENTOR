@@ -7,6 +7,7 @@ from aiogram import Bot
 from sqlalchemy import or_, select
 from sqlalchemy.orm import selectinload
 
+from bot.stickers import get_random_sticker_file_id
 from db.database import async_session_maker
 from db.models import User, UserProfile, UserTask
 
@@ -64,94 +65,95 @@ def _is_burnout_state(profile: UserProfile | None) -> bool:
     return energy_level in {"low", "very_low", "empty", "burnout"}
 
 
-def _build_regular_followup(user: User) -> tuple[str, str]:
+def _get_user_name(user: User) -> str:
+    return (user.first_name or "").strip()
+
+
+def _build_regular_followup(user: User) -> tuple[str, str, str]:
+    name = _get_user_name(user)
+
     openers = [
         "Ты где завис?",
-        "Ты чего затих?",
-        "Ну и что случилось?",
-        "Я тебя потерял. Что там у тебя?",
-        "Слушай, что тебя сейчас стопорит?",
-        "Ты где сейчас — в деле, в сомнениях или просто устал?",
+        "Ты где?",
+        "Почему завис?",
+        "Ты чего пропал?",
+        "Ну ты где там?",
+        "Куда выпал?",
     ]
 
-    insights = [
-        "Сначала соберем, потом улучшим.",
-        "Криво — нормально. Пусто — хуже.",
-        "Не шлифуй то, чего еще нет.",
-        "Большое не упрощаем. Большое разбираем.",
-        "Обычно самый вязкий этап — после первого старта.",
-        "Чаще всего стопор не в лени, а в перегруженном входе.",
+    second_touches = [
+        "Сделай лучше криво, чем никак.",
+        "Не шлифуй. Просто зайди обратно.",
+        "Один маленький кусок — уже нормально.",
+        "Не думай слишком долго. Зайди руками.",
+        "Хотя бы короткий заход сегодня.",
     ]
 
     opener = random.choice(openers)
-    insight = random.choice(insights)
+    second_touch = random.choice(second_touches)
 
-    text = (
-        f"{opener}\n\n"
-        f"{insight}"
-    )
-    return text, "regular_no_task"
+    if name and random.random() < 0.45:
+        opener = f"{name}, {opener[0].lower() + opener[1:]}"
+
+    return opener, second_touch, "regular_no_task"
 
 
-def _build_burnout_followup(user: User, profile: UserProfile | None) -> tuple[str, str]:
-    energy_level = (profile.energy_level or "").strip().lower() if profile else ""
+def _build_burnout_followup(user: User, profile: UserProfile | None) -> tuple[str, str, str]:
+    name = _get_user_name(user)
+    _energy_level = (profile.energy_level or "").strip().lower() if profile else ""
 
     openers = [
-        "Ну как ты себя чувствуешь?",
-        "Давай просто поболтаем. Как ты?",
-        "Я не давлю. Просто хочу понять, как ты сейчас.",
-        "Сейчас не тащу тебя в задачу. Просто скажи, как ты.",
+        "Как ты?",
+        "Ты как сейчас?",
+        "Я не давлю. Просто скажи, как ты.",
+        "Давай без рывков. Как ты сейчас?",
     ]
 
     support_lines = [
         "Ты устал не от задачи, а от того, что она висит в голове и давит.",
-        "Сейчас важнее выдохнуть, чем героически тащить все сразу.",
-        "Иногда лучший ход — не рывок, а очень маленький вход обратно.",
-        "Если сил мало, не надо тащить весь кусок. Достаточно зацепиться за край.",
+        "Сейчас не нужен рывок. Нужен маленький живой вход обратно.",
+        "Если тяжело, не тащи все целиком. Зацепись за самый край.",
+        "Сейчас важнее выдохнуть и вернуться маленьким шагом.",
     ]
 
     opener = random.choice(openers)
     support = random.choice(support_lines)
 
-    if energy_level in {"low", "very_low", "empty", "burnout"}:
-        text = (
-            f"{opener}\n\n"
-            f"{support}"
-        )
-        return text, "burnout_no_task"
+    if name and random.random() < 0.45:
+        opener = f"{name}, {opener[0].lower() + opener[1:]}"
 
-    text = (
-        f"{opener}\n\n"
-        f"{support}"
-    )
-    return text, "burnout_no_task"
+    return opener, support, "burnout_no_task"
 
 
-def _build_push_followup(user: User) -> tuple[str, str]:
-    push_messages = [
-        (
-            "Так, стоп.\n\n"
-            "Ты сейчас больше крутишь это в голове, чем двигаешь.\n\n"
-            "Нужен один короткий честный заход сегодня."
-        ),
-        (
-            "Хватит ждать нужного состояния.\n\n"
-            "Нужен не рывок. Нужен короткий вход."
-        ),
-        (
-            "Не пропадай.\n\n"
-            "Один маленький кусок сегодня — и уже нормально."
-        ),
-        (
-            "Пора возвращаться в движение.\n\n"
-            "Хотя бы 10 минут чего-то реального сегодня."
-        ),
+def _build_push_followup(user: User) -> tuple[str, str, str]:
+    name = _get_user_name(user)
+
+    openers = [
+        "Ты чего завис?",
+        "Так, ты где?",
+        "Не пропадай.",
+        "Ну-ка вернись в движение.",
     ]
 
-    return random.choice(push_messages), "push_no_task"
+    second_touches = [
+        "Нужен не рывок. Нужен короткий заход.",
+        "Хотя бы 10 минут чего-то реального сегодня.",
+        "Один маленький кусок сегодня — и уже хорошо.",
+        "Сейчас не идеал нужен. Нужен вход обратно.",
+    ]
+
+    opener = random.choice(openers)
+    second_touch = random.choice(second_touches)
+
+    if name and random.random() < 0.45:
+        opener = f"{name}, {opener[0].lower() + opener[1:]}"
+
+    return opener, second_touch, "push_no_task"
 
 
 def _build_push_explanation_followup(user: User) -> tuple[str, str]:
+    name = _get_user_name(user)
+
     openers = [
         "Я тогда написал жестче не чтобы додавить тебя.",
         "Прошлое сообщение было резче специально.",
@@ -159,6 +161,8 @@ def _build_push_explanation_followup(user: User) -> tuple[str, str]:
     ]
 
     opener = random.choice(openers)
+    if name and random.random() < 0.35:
+        opener = f"{name}, {opener[0].lower() + opener[1:]}"
 
     text = (
         f"{opener}\n\n"
@@ -190,29 +194,71 @@ def _should_send_push_followup(user: User, profile: UserProfile | None, now: dat
     return random.random() < 0.25
 
 
+async def _send_optional_followup_sticker(bot: Bot, telegram_user_id: int) -> None:
+    sticker_id = get_random_sticker_file_id("followup_live")
+    if not sticker_id:
+        return
+
+    try:
+        await bot.send_sticker(telegram_user_id, sticker_id)
+    except Exception:
+        logger.exception("Не удалось отправить follow-up sticker")
+
+
+async def _send_two_touch_followup(
+    bot: Bot,
+    telegram_user_id: int,
+    first_text: str,
+    second_text: str,
+) -> None:
+    await bot.send_message(telegram_user_id, first_text)
+    await asyncio.sleep(random.randint(2, 5))
+    await bot.send_message(telegram_user_id, second_text)
+
+
 async def _send_followup(
     bot: Bot,
     user: User,
     profile: UserProfile | None,
     now: datetime,
 ) -> tuple[str, bool, bool]:
+    is_first_followup = user.last_followup_sent_at is None
+
     if user.push_explanation_due_at is not None and user.push_explanation_due_at <= now:
         text, followup_type = _build_push_explanation_followup(user)
         await bot.send_message(user.telegram_user_id, text)
         return followup_type, False, True
 
+    if is_first_followup:
+        await _send_optional_followup_sticker(bot, user.telegram_user_id)
+
     if _is_burnout_state(profile):
-        text, followup_type = _build_burnout_followup(user, profile)
-        await bot.send_message(user.telegram_user_id, text)
+        first_text, second_text, followup_type = _build_burnout_followup(user, profile)
+        await _send_two_touch_followup(
+            bot,
+            user.telegram_user_id,
+            first_text,
+            second_text,
+        )
         return followup_type, False, False
 
     if _should_send_push_followup(user, profile, now):
-        text, followup_type = _build_push_followup(user)
-        await bot.send_message(user.telegram_user_id, text)
+        first_text, second_text, followup_type = _build_push_followup(user)
+        await _send_two_touch_followup(
+            bot,
+            user.telegram_user_id,
+            first_text,
+            second_text,
+        )
         return followup_type, True, False
 
-    text, followup_type = _build_regular_followup(user)
-    await bot.send_message(user.telegram_user_id, text)
+    first_text, second_text, followup_type = _build_regular_followup(user)
+    await _send_two_touch_followup(
+        bot,
+        user.telegram_user_id,
+        first_text,
+        second_text,
+    )
     return followup_type, False, False
 
 
@@ -259,63 +305,36 @@ async def _process_due_users(bot: Bot) -> None:
 
                 user.last_followup_sent_at = now
                 user.last_followup_type = followup_type
+                user.next_followup_at = _random_next_followup_time()
                 user.updated_at = now
 
                 if is_push:
                     user.last_push_followup_at = now
                     user.push_explanation_due_at = _random_push_explanation_time()
-                    user.next_followup_at = _random_next_followup_time()
                 elif is_explanation:
                     user.push_explanation_due_at = None
-                    user.next_followup_at = _random_next_followup_time()
                 else:
-                    user.next_followup_at = _random_next_followup_time()
+                    user.push_explanation_due_at = None
 
-            except Exception as e:
+            except Exception:
                 logger.exception(
-                    "Failed to send follow-up to telegram_user_id=%s: %s",
+                    "Ошибка при отправке follow-up для user_id=%s telegram_user_id=%s",
+                    user.id,
                     user.telegram_user_id,
-                    e,
                 )
+                user.next_followup_at = _random_next_followup_time()
+                user.updated_at = now
 
         await session.commit()
 
 
-async def scheduler_loop(bot: Bot, stop_event: asyncio.Event) -> None:
-    logger.info("Scheduler loop started")
+async def run_scheduler(bot: Bot) -> None:
+    logger.info("Scheduler started")
 
-    while not stop_event.is_set():
+    while True:
         try:
             await _process_due_users(bot)
-        except Exception as e:
-            logger.exception("Scheduler iteration failed: %s", e)
+        except Exception:
+            logger.exception("Ошибка в scheduler loop")
 
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=SCHEDULER_POLL_SECONDS)
-        except asyncio.TimeoutError:
-            pass
-
-    logger.info("Scheduler loop stopped")
-
-
-class SchedulerService:
-    def __init__(self, bot: Bot) -> None:
-        self.bot = bot
-        self._task: asyncio.Task | None = None
-        self._stop_event = asyncio.Event()
-
-    async def start(self) -> None:
-        if self._task is not None and not self._task.done():
-            return
-
-        self._stop_event = asyncio.Event()
-        self._task = asyncio.create_task(
-            scheduler_loop(self.bot, self._stop_event)
-        )
-
-    async def stop(self) -> None:
-        self._stop_event.set()
-
-        if self._task is not None:
-            await self._task
-            self._task = None
+        await asyncio.sleep(SCHEDULER_POLL_SECONDS)

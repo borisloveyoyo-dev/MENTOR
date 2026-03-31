@@ -5,7 +5,7 @@ from sqlalchemy import select
 
 from db.database import async_session_maker
 from db.models import User, UserProfile, UserTask
-from services.ai_service import AIService, DirectionOption
+from services.ai_service import AIService
 
 
 class MentorServiceError(Exception):
@@ -175,6 +175,7 @@ class MentorService:
 
             return {
                 "task_title": plan.step_title,
+                "short_perspective": plan.short_perspective,
                 "step_description": plan.step_description,
                 "why_this_step": plan.why_this_step,
                 "how_to_do_it": plan.how_to_do_it,
