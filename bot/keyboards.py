@@ -107,3 +107,19 @@ def get_payment_keyboard(payment_url: str) -> InlineKeyboardMarkup:
 
     builder.adjust(1)
     return builder.as_markup()
+
+
+def get_delete_data_confirm_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+
+    builder.button(
+        text="Да, удалить",
+        callback_data="user:delete:confirm",
+    )
+    builder.button(
+        text="Нет, оставить",
+        callback_data="user:delete:cancel",
+    )
+
+    builder.adjust(1)
+    return builder.as_markup()

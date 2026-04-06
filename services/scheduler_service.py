@@ -10,6 +10,10 @@ from sqlalchemy.orm import selectinload
 from bot.stickers import get_random_sticker_file_id
 from db.database import async_session_maker
 from db.models import User, UserProfile, UserTask
+from services.milestone_service import (
+    MilestoneServiceError,
+    build_user_milestone_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +25,7 @@ RECENT_USER_ACTIVITY_HOURS = 2
 PUSH_MIN_SILENCE_HOURS = 18
 PUSH_COOLDOWN_HOURS = 48
 PUSH_EXPLANATION_DELAY_HOURS = 12
+MILESTONE_INTERVAL_DAYS = 3
 
 
 def _utcnow() -> datetime:
@@ -67,6 +72,26 @@ def _is_burnout_state(profile: UserProfile | None) -> bool:
 
 def _get_user_name(user: User) -> str:
     return (user.first_name or "").strip()
+
+
+def _should_send_milestone(user: User, profile: UserProfile | None, now: datetime) -> bool:
+    if not user.selected_direction:
+        return False
+
+    if profile is None:
+        return False
+
+    if profile.onboarding_completed_at is None:
+        return False
+
+    if profile.onboarding_completed_at > now - timedelta(days=MILESTONE_INTERVAL_DAYS):
+        return False
+
+    if user.last_milestone_sent_at is not None:
+        if user.last_milestone_sent_at > now - timedelta(days=MILESTONE_INTERVAL_DAYS):
+            return False
+
+    return True
 
 
 def _build_regular_followup(user: User) -> tuple[str, str, str]:
@@ -194,15 +219,29 @@ def _should_send_push_followup(user: User, profile: UserProfile | None, now: dat
     return random.random() < 0.25
 
 
-async def _send_optional_followup_sticker(bot: Bot, telegram_user_id: int) -> None:
-    sticker_id = get_random_sticker_file_id("followup_live")
+async def _send_required_sticker(bot: Bot, telegram_user_id: int, pack_name: str) -> None:
+    sticker_id = get_random_sticker_file_id(pack_name)
     if not sticker_id:
+        logger.warning(
+            "required_sticker_missing pack=%s telegram_user_id=%s",
+            pack_name,
+            telegram_user_id,
+        )
         return
 
     try:
         await bot.send_sticker(telegram_user_id, sticker_id)
+        logger.info(
+            "required_sticker_sent pack=%s telegram_user_id=%s",
+            pack_name,
+            telegram_user_id,
+        )
     except Exception:
-        logger.exception("Не удалось отправить follow-up sticker")
+        logger.exception(
+            "required_sticker_failed pack=%s telegram_user_id=%s",
+            pack_name,
+            telegram_user_id,
+        )
 
 
 async def _send_two_touch_followup(
@@ -222,17 +261,13 @@ async def _send_followup(
     profile: UserProfile | None,
     now: datetime,
 ) -> tuple[str, bool, bool]:
-    is_first_followup = user.last_followup_sent_at is None
-
     if user.push_explanation_due_at is not None and user.push_explanation_due_at <= now:
         text, followup_type = _build_push_explanation_followup(user)
         await bot.send_message(user.telegram_user_id, text)
         return followup_type, False, True
 
-    if is_first_followup:
-        await _send_optional_followup_sticker(bot, user.telegram_user_id)
-
     if _is_burnout_state(profile):
+        await _send_required_sticker(bot, user.telegram_user_id, "followup_live")
         first_text, second_text, followup_type = _build_burnout_followup(user, profile)
         await _send_two_touch_followup(
             bot,
@@ -243,6 +278,7 @@ async def _send_followup(
         return followup_type, False, False
 
     if _should_send_push_followup(user, profile, now):
+        await _send_required_sticker(bot, user.telegram_user_id, "push_soft")
         first_text, second_text, followup_type = _build_push_followup(user)
         await _send_two_touch_followup(
             bot,
@@ -252,6 +288,7 @@ async def _send_followup(
         )
         return followup_type, True, False
 
+    await _send_required_sticker(bot, user.telegram_user_id, "followup_live")
     first_text, second_text, followup_type = _build_regular_followup(user)
     await _send_two_touch_followup(
         bot,
@@ -260,6 +297,44 @@ async def _send_followup(
         second_text,
     )
     return followup_type, False, False
+
+
+async def _send_milestone_if_due(
+    bot: Bot,
+    user: User,
+    profile: UserProfile | None,
+    now: datetime,
+) -> bool:
+    if not _should_send_milestone(user, profile, now):
+        return False
+
+    try:
+        milestone_text = await build_user_milestone_text(
+            user_id=user.id,
+            selected_direction=user.selected_direction or "",
+        )
+    except MilestoneServiceError:
+        logger.exception("Не удалось собрать маяк для user id=%s", user.id)
+        return False
+    except Exception:
+        logger.exception("Неожиданная ошибка при сборке маяка для user id=%s", user.id)
+        return False
+
+    if not milestone_text:
+        return False
+
+    try:
+        await bot.send_message(
+            user.telegram_user_id,
+            f"Смотри, наш ближайший маяк:\n\n{milestone_text}",
+        )
+    except Exception:
+        logger.exception("Не удалось отправить маяк пользователю id=%s", user.id)
+        return False
+
+    user.last_milestone_sent_at = now
+    user.updated_at = now
+    return True
 
 
 async def _process_due_users(bot: Bot) -> None:
@@ -296,6 +371,19 @@ async def _process_due_users(bot: Bot) -> None:
                 continue
 
             try:
+                milestone_sent = await _send_milestone_if_due(
+                    bot,
+                    user,
+                    profile,
+                    now,
+                )
+
+                if milestone_sent:
+                    user.next_followup_at = _random_next_followup_time()
+                    user.push_explanation_due_at = None
+                    user.updated_at = now
+                    continue
+
                 followup_type, is_push, is_explanation = await _send_followup(
                     bot,
                     user,
@@ -317,24 +405,45 @@ async def _process_due_users(bot: Bot) -> None:
                     user.push_explanation_due_at = None
 
             except Exception:
-                logger.exception(
-                    "Ошибка при отправке follow-up для user_id=%s telegram_user_id=%s",
-                    user.id,
-                    user.telegram_user_id,
-                )
+                logger.exception("Ошибка при отправке follow-up пользователю id=%s", user.id)
                 user.next_followup_at = _random_next_followup_time()
                 user.updated_at = now
 
         await session.commit()
 
 
-async def run_scheduler(bot: Bot) -> None:
-    logger.info("Scheduler started")
+class SchedulerService:
+    def __init__(self, bot: Bot) -> None:
+        self.bot = bot
+        self._task: asyncio.Task | None = None
+        self._is_running = False
 
-    while True:
+    async def start(self) -> None:
+        if self._is_running:
+            return
+
+        self._is_running = True
+        self._task = asyncio.create_task(self._run_loop())
+
+    async def stop(self) -> None:
+        self._is_running = False
+
+        if self._task is None:
+            return
+
+        self._task.cancel()
         try:
-            await _process_due_users(bot)
-        except Exception:
-            logger.exception("Ошибка в scheduler loop")
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._task = None
 
-        await asyncio.sleep(SCHEDULER_POLL_SECONDS)
+    async def _run_loop(self) -> None:
+        while self._is_running:
+            try:
+                await _process_due_users(self.bot)
+            except Exception:
+                logger.exception("Ошибка в scheduler loop")
+
+            await asyncio.sleep(SCHEDULER_POLL_SECONDS)
