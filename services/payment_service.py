@@ -38,6 +38,12 @@ class PaymentWebhookResult:
 
 
 class PaymentService:
+    ALLOWED_PAYMENT_EVENTS = {
+        "payment.succeeded": "succeeded",
+        "payment.waiting_for_capture": "waiting_for_capture",
+        "payment.canceled": "canceled",
+    }
+
     def __init__(self) -> None:
         self.shop_id = os.getenv("YKASSA_SHOP_ID") or os.getenv("YOOKASSA_SHOP_ID")
         self.api_key = os.getenv("YKASSA_API_KEY") or os.getenv("YOOKASSA_API_KEY")
@@ -195,6 +201,9 @@ class PaymentService:
         if not event:
             raise PaymentServiceError("В webhook нет поля event")
 
+        if event not in self.ALLOWED_PAYMENT_EVENTS:
+            raise PaymentServiceError(f"Неподдерживаемое событие webhook: {event}")
+
         if not isinstance(obj, dict):
             raise PaymentServiceError("В webhook нет корректного поля object")
 
@@ -204,19 +213,40 @@ class PaymentService:
 
         payment_data = await self.get_payment(payment_id)
 
+        api_payment_id = str(payment_data.get("id") or "").strip()
+        if not api_payment_id:
+            raise PaymentServiceError("YooKassa API не вернула payment_id")
+
+        if api_payment_id != payment_id:
+            raise PaymentServiceError("payment_id в webhook не совпадает с payment_id из YooKassa API")
+
         status = str(payment_data.get("status") or "").strip()
+        expected_status = self.ALLOWED_PAYMENT_EVENTS[event]
+        if status != expected_status:
+            raise PaymentServiceError(
+                f"Статус платежа {status!r} не соответствует событию {event!r}"
+            )
+
         paid = bool(payment_data.get("paid") is True)
+
+        if event == "payment.succeeded" and not paid:
+            raise PaymentServiceError("Для payment.succeeded платеж должен быть paid=true")
+
         metadata = payment_data.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
 
         user_id_raw = metadata.get("user_id")
         tariff_code_raw = metadata.get("tariff_code")
 
         user_id: int | None = None
         if user_id_raw is not None:
-            try:
-                user_id = int(str(user_id_raw).strip())
-            except ValueError:
-                user_id = None
+            user_id_candidate = str(user_id_raw).strip()
+            if user_id_candidate:
+                try:
+                    user_id = int(user_id_candidate)
+                except ValueError:
+                    raise PaymentServiceError("metadata.user_id должен быть целым числом")
 
         tariff_code = str(tariff_code_raw).strip() if tariff_code_raw is not None else None
         if tariff_code == "":

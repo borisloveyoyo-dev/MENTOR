@@ -258,6 +258,156 @@ def build_sticker_debug_reply(message: Message) -> str:
     return "\n".join(parts)
 
 
+def _normalize_point_text(text: str) -> str:
+    cleaned = " ".join((text or "").strip().split())
+    return cleaned.strip(" ,.;:-")
+
+
+def _split_into_profile_points(text: str | None, *, limit: int = 2) -> list[str]:
+    if not text:
+        return []
+
+    normalized = text.replace("\n", ". ")
+    separators = ["•", ";", "—", "-", "—", "\r"]
+    for separator in separators:
+        normalized = normalized.replace(separator, ".")
+
+    raw_parts = [part.strip() for part in normalized.split(".")]
+    points: list[str] = []
+
+    for raw in raw_parts:
+        cleaned = _normalize_point_text(raw)
+        if len(cleaned) < 4:
+            continue
+        lowered = cleaned.lower()
+        if lowered in {"не знаю", "пока не знаю", "не понимаю", "пока не понимаю"}:
+            continue
+        points.append(cleaned)
+
+    unique_points: list[str] = []
+    seen: set[str] = set()
+
+    for point in points:
+        key = point.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_points.append(point)
+        if len(unique_points) >= limit:
+            break
+
+    return unique_points
+
+
+def _collect_profile_reflection(profile: UserProfile) -> tuple[list[str], list[str]]:
+    strengths: list[str] = []
+    signals: list[str] = []
+
+    strengths.extend(_split_into_profile_points(profile.help_request_reason, limit=2))
+    strengths.extend(_split_into_profile_points(profile.appreciation_reason, limit=2))
+
+    signals.extend(_split_into_profile_points(profile.free_time_style, limit=2))
+    signals.extend(_split_into_profile_points(profile.about_text, limit=2))
+    signals.extend(_split_into_profile_points(profile.current_income_source, limit=1))
+
+    strengths_unique: list[str] = []
+    strengths_seen: set[str] = set()
+    for item in strengths:
+        key = item.lower()
+        if key in strengths_seen:
+            continue
+        strengths_seen.add(key)
+        strengths_unique.append(item)
+        if len(strengths_unique) >= 3:
+            break
+
+    signals_unique: list[str] = []
+    signals_seen: set[str] = set()
+    for item in signals:
+        key = item.lower()
+        if key in signals_seen:
+            continue
+        signals_seen.add(key)
+        signals_unique.append(item)
+        if len(signals_unique) >= 3:
+            break
+
+    return strengths_unique, signals_unique
+
+
+def _build_onboarding_reflection_text(
+    *,
+    display_name: str,
+    strengths: list[str],
+    signals: list[str],
+) -> str:
+    intro = f"{display_name}, " if display_name else ""
+
+    lines: list[str] = [
+        f"{intro}сейчас уже видно, что ты не с пустыми руками.",
+        "",
+    ]
+
+    if strengths:
+        lines.append("Вот на что в тебе уже можно опираться:")
+        for item in strengths:
+            lines.append(f"— {item}")
+        lines.append("")
+
+    if signals:
+        lines.append("И вот что у тебя повторяется в ответах:")
+        for item in signals:
+            lines.append(f"— {item}")
+        lines.append("")
+
+    lines.append(
+        "Это не приговор и не ярлык.\n"
+        "Просто база, от которой уже можно двигаться дальше."
+    )
+
+    return "\n".join(lines).strip()
+
+
+def _build_progress_text(
+    *,
+    direction: str | None,
+    completed_tasks_count: int,
+    pending_task_title: str | None,
+    strengths_summary: str | None,
+    repeated_signals_summary: str | None,
+) -> str:
+    lines: list[str] = ["Вот где ты сейчас:", ""]
+
+    if direction:
+        lines.append(f"Направление:\n— {direction}")
+    else:
+        lines.append("Направление пока не зафиксировано.")
+
+    lines.append("")
+    lines.append(f"Закрыто шагов: {completed_tasks_count}")
+
+    if pending_task_title:
+        lines.append("")
+        lines.append(f"Текущий шаг:\n— {pending_task_title}")
+    else:
+        lines.append("")
+        lines.append("Сейчас активный шаг не висит.")
+
+    if strengths_summary:
+        lines.append("")
+        lines.append("На что в себе уже можно опираться:")
+        lines.extend(strengths_summary.splitlines())
+
+    if repeated_signals_summary:
+        lines.append("")
+        lines.append("Что у тебя повторяется:")
+        lines.extend(repeated_signals_summary.splitlines())
+
+    lines.append("")
+    lines.append("Если хочешь двигаться дальше — жми /next.")
+    return "\n".join(lines).strip()
+
+
 async def send_optional_sticker(message: Message, pack_name: str) -> None:
     sticker_id = get_random_sticker_file_id(pack_name)
     if not sticker_id:
@@ -575,6 +725,79 @@ async def mark_onboarding_completed(user_id: int) -> None:
 
         await session.commit()
         logger.info("onboarding_completed user_id=%s", user_id)
+
+
+async def build_and_save_onboarding_reflection(user_id: int) -> str | None:
+    async with async_session_maker() as session:
+        user_result = await session.execute(
+            select(User).where(User.id == user_id)
+        )
+        user = user_result.scalar_one_or_none()
+
+        profile_result = await session.execute(
+            select(UserProfile).where(UserProfile.user_id == user_id)
+        )
+        profile = profile_result.scalar_one_or_none()
+
+        if user is None or profile is None:
+            return None
+
+        strengths, signals = _collect_profile_reflection(profile)
+
+        strengths_summary = "\n".join(f"— {item}" for item in strengths) if strengths else None
+        repeated_signals_summary = "\n".join(f"— {item}" for item in signals) if signals else None
+
+        profile.observed_strengths_summary = strengths_summary
+        profile.repeated_signals_summary = repeated_signals_summary
+        profile.updated_at = utcnow()
+
+        await session.commit()
+
+        if not strengths and not signals:
+            return None
+
+        return _build_onboarding_reflection_text(
+            display_name=get_display_name(user),
+            strengths=strengths,
+            signals=signals,
+        )
+
+
+async def build_user_progress_message(user_id: int) -> str | None:
+    async with async_session_maker() as session:
+        user_result = await session.execute(
+            select(User).where(User.id == user_id)
+        )
+        user = user_result.scalar_one_or_none()
+
+        if user is None:
+            return None
+
+        profile_result = await session.execute(
+            select(UserProfile).where(UserProfile.user_id == user_id)
+        )
+        profile = profile_result.scalar_one_or_none()
+
+        completed_result = await session.execute(
+            select(UserTask).where(UserTask.user_id == user_id).where(UserTask.status == "done")
+        )
+        completed_tasks = completed_result.scalars().all()
+
+        pending_result = await session.execute(
+            select(UserTask)
+            .where(UserTask.user_id == user_id)
+            .where(UserTask.status == "pending")
+            .order_by(UserTask.assigned_at.desc(), UserTask.id.desc())
+        )
+        pending_task = pending_result.scalars().first()
+
+        return _build_progress_text(
+            direction=user.selected_direction,
+            completed_tasks_count=len(completed_tasks),
+            pending_task_title=pending_task.title if pending_task else None,
+            strengths_summary=profile.observed_strengths_summary if profile else None,
+            repeated_signals_summary=profile.repeated_signals_summary if profile else None,
+        )
 
 
 async def has_active_subscription(user_id: int) -> bool:
@@ -1454,6 +1677,36 @@ async def cmd_next(message: Message) -> None:
         )
 
 
+@router.message(Command("progress"))
+async def cmd_progress(message: Message) -> None:
+    logger.info(
+        "handler_cmd_progress user_id=%s text=%r",
+        message.from_user.id if message.from_user else None,
+        message.text,
+    )
+
+    if message.from_user is None:
+        return
+
+    user, _profile = await get_user_and_profile_by_telegram_id(message.from_user.id)
+    if user is None:
+        await message.answer(DEFAULT_REPLY_TEXT)
+        return
+
+    await touch_user_activity(user.id)
+
+    progress_text = await build_user_progress_message(user.id)
+    if not progress_text:
+        await human_answer(
+            message,
+            "Я пока не собрал по тебе прогресс. Если хочешь начать — жми /start.",
+        )
+        return
+
+    await send_optional_sticker(message, "progress_small")
+    await human_answer(message, progress_text)
+
+
 @router.message(Command("delete_me"))
 async def cmd_delete_me(message: Message) -> None:
     logger.info(
@@ -1924,7 +2177,19 @@ async def handle_any_message(message: Message) -> None:
         )
         await mark_onboarding_completed(user.id)
 
+        reflection_text = await build_and_save_onboarding_reflection(user.id)
+
         await human_answer(message, ONBOARDING_FINISH_TEXT, min_delay=1.0, max_delay=1.8)
+
+        if reflection_text:
+            await send_optional_sticker(message, "progress_small")
+            await human_answer(
+                message,
+                reflection_text,
+                min_delay=1.2,
+                max_delay=2.0,
+            )
+
         await show_or_generate_directions(message, user)
         return
 
