@@ -32,16 +32,19 @@ from bot.texts import (
     WELCOME_TEXT,
 )
 from db.database import async_session_maker
-from db.models import Payment, Subscription, User, UserProfile, UserTask
+from db.models import Payment, Subscription, TaskSubmission, User, UserProfile, UserTask
 from services.ai_service import AIService, AIServiceError
 from services.mentor_service import (
     MentorServiceError,
     analyze_user_profile_and_save,
+    build_next_task_difficulty_mode,
     build_state_reply,
     detect_user_state_from_text,
     generate_first_task_for_user,
+    get_completed_tasks_count_for_user,
     get_latest_pending_task_title,
     get_saved_profile_directions,
+    normalize_task_difficulty_mode,
     save_user_selected_direction,
 )
 from services.payment_service import PaymentServiceError, create_payment_link
@@ -205,7 +208,7 @@ def build_followup_after_review(
         )
 
     return (
-        "Слушай, ты хотя бы не завис и что-то прислал ��\n"
+        "Слушай, ты хотя бы не завис и что-то прислал 😏\n"
         "Но сам шаг нам был нужен чуть для другого.\n"
         f"Давай добьем вот это:\n{next_step_hint}"
     )
@@ -841,6 +844,27 @@ async def get_latest_pending_task(user_id: int) -> UserTask | None:
         return result.scalars().first()
 
 
+async def get_latest_completed_task(user_id: int) -> UserTask | None:
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(UserTask)
+            .where(UserTask.user_id == user_id)
+            .where(UserTask.status == "done")
+            .order_by(UserTask.completed_at.desc(), UserTask.id.desc())
+        )
+        return result.scalars().first()
+
+
+async def get_latest_submission_for_task(task_id: int) -> TaskSubmission | None:
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(TaskSubmission)
+            .where(TaskSubmission.task_id == task_id)
+            .order_by(TaskSubmission.created_at.desc(), TaskSubmission.id.desc())
+        )
+        return result.scalars().first()
+
+
 async def should_require_payment(user_id: int) -> bool:
     if await has_active_subscription(user_id):
         return False
@@ -975,6 +999,7 @@ async def create_next_task_for_user(
     what_to_fix: list[str],
     next_step_mode: str,
     next_step_hint: str,
+    current_difficulty_mode: str | None = None,
 ) -> dict:
     async with async_session_maker() as session:
         user_result = await session.execute(
@@ -1007,6 +1032,13 @@ async def create_next_task_for_user(
             about_text=profile.about_text,
         )
 
+        completed_tasks_count = await get_completed_tasks_count_for_user(user_id)
+        difficulty_mode = build_next_task_difficulty_mode(
+            current_difficulty_mode=current_difficulty_mode,
+            completed_tasks_count=completed_tasks_count,
+            next_step_mode=next_step_mode,
+        )
+
         task_description_lines: list[str] = []
         task_description_lines.append(plan.step_description)
         task_description_lines.append("")
@@ -1034,12 +1066,17 @@ async def create_next_task_for_user(
             title=plan.step_title,
             description="\n".join(task_description_lines),
             status="pending",
-            difficulty_mode="normal",
+            difficulty_mode=difficulty_mode,
         )
         session.add(new_task)
         await session.commit()
 
-        logger.info("next_task_created user_id=%s task_title=%s", user_id, plan.step_title)
+        logger.info(
+            "next_task_created user_id=%s task_title=%s difficulty_mode=%s",
+            user_id,
+            plan.step_title,
+            difficulty_mode,
+        )
 
         return {
             "task_title": plan.step_title,
@@ -1048,7 +1085,61 @@ async def create_next_task_for_user(
             "how_to_do_it": plan.how_to_do_it,
             "recommended_tools": plan.recommended_tools,
             "success_criteria": plan.success_criteria,
+            "difficulty_mode": difficulty_mode,
         }
+
+
+async def create_next_task_from_latest_context(user_id: int) -> dict:
+    user, profile = await get_user_and_profile_by_telegram_id(user_id)
+    if user is None or profile is None:
+        raise MentorServiceError("Не удалось найти пользователя")
+
+    if not user.selected_direction:
+        raise MentorServiceError("У пользователя пока не выбрано направление")
+
+    latest_done_task = await get_latest_completed_task(user.id)
+    if latest_done_task is None:
+        return await generate_first_task_for_user(user.id)
+
+    latest_submission = await get_latest_submission_for_task(latest_done_task.id)
+
+    review_summary = "Шаг закрыт пользователем через /done."
+    strengths = ["Пользователь довел предыдущий шаг до завершения."]
+    what_to_fix: list[str] = []
+    next_step_mode = "harder"
+    next_step_hint = "Дай следующий шаг по той же оси навыка, чуть профессиональнее, но без перегруза."
+
+    if latest_submission is not None:
+        review_summary = latest_submission.review_summary or review_summary
+        next_step_mode = latest_submission.next_step_mode or next_step_mode
+        next_step_hint = latest_submission.next_step_hint or next_step_hint
+
+        try:
+            strengths_data = json.loads(latest_submission.strengths_json) if latest_submission.strengths_json else []
+            if isinstance(strengths_data, list):
+                strengths = [str(item).strip() for item in strengths_data if str(item).strip()]
+        except Exception:
+            pass
+
+        try:
+            fix_data = json.loads(latest_submission.what_to_fix_json) if latest_submission.what_to_fix_json else []
+            if isinstance(fix_data, list):
+                what_to_fix = [str(item).strip() for item in fix_data if str(item).strip()]
+        except Exception:
+            pass
+
+    return await create_next_task_for_user(
+        user_id=user.id,
+        selected_direction=user.selected_direction,
+        current_task_title=latest_done_task.title,
+        current_task_description=latest_done_task.description,
+        review_summary=review_summary,
+        strengths=strengths,
+        what_to_fix=what_to_fix,
+        next_step_mode=next_step_mode,
+        next_step_hint=next_step_hint,
+        current_difficulty_mode=normalize_task_difficulty_mode(latest_done_task.difficulty_mode),
+    )
 
 
 async def delete_user_and_all_data_by_telegram_id(telegram_user_id: int) -> bool:
@@ -1254,6 +1345,7 @@ async def handle_task_submission_photo(message: Message, user: User) -> bool:
                 what_to_fix=review.what_to_fix,
                 next_step_mode=review.next_step_mode,
                 next_step_hint=review.next_step_hint,
+                current_difficulty_mode=normalize_task_difficulty_mode(current_task.difficulty_mode),
             )
 
         await send_optional_sticker(message, "first_step")
@@ -1403,6 +1495,7 @@ async def handle_task_submission_voice(message: Message, user: User) -> bool:
                 what_to_fix=review.what_to_fix,
                 next_step_mode=review.next_step_mode,
                 next_step_hint=review.next_step_hint,
+                current_difficulty_mode=normalize_task_difficulty_mode(current_task.difficulty_mode),
             )
 
         await send_optional_sticker(message, "first_step")
@@ -1646,7 +1739,7 @@ async def cmd_next(message: Message) -> None:
             action=ChatAction.TYPING,
         ):
             await asyncio.sleep(random.uniform(3.0, 5.0))
-            next_task = await generate_first_task_for_user(user.id)
+            next_task = await create_next_task_from_latest_context(user.id)
 
         await send_optional_sticker(message, "first_step")
         await human_answer(

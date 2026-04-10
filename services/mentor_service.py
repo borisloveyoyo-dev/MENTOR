@@ -1,7 +1,7 @@
 import json
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from db.database import async_session_maker
 from db.models import User, UserProfile, UserTask
@@ -10,6 +10,10 @@ from services.ai_service import AIService
 
 class MentorServiceError(Exception):
     pass
+
+
+DIFFICULTY_LADDER = ("starter", "base", "growth", "pro")
+DEFAULT_DIFFICULTY_MODE = "starter"
 
 
 class MentorService:
@@ -162,12 +166,14 @@ class MentorService:
                 success_criteria=plan.success_criteria,
             )
 
+            difficulty_mode = self.get_first_task_difficulty_mode()
+
             task = UserTask(
                 user_id=user_id,
                 title=plan.step_title,
                 description=task_description,
                 status="pending",
-                difficulty_mode="normal",
+                difficulty_mode=difficulty_mode,
             )
             session.add(task)
 
@@ -181,6 +187,7 @@ class MentorService:
                 "how_to_do_it": plan.how_to_do_it,
                 "recommended_tools": plan.recommended_tools,
                 "success_criteria": plan.success_criteria,
+                "difficulty_mode": difficulty_mode,
             }
 
     async def get_latest_pending_task_title(self, user_id: int) -> str | None:
@@ -197,6 +204,62 @@ class MentorService:
                 return None
 
             return task.title.strip()
+
+    async def get_completed_tasks_count(self, user_id: int) -> int:
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(func.count(UserTask.id))
+                .where(UserTask.user_id == user_id)
+                .where(UserTask.status == "done")
+            )
+            count = result.scalar_one()
+            return int(count or 0)
+
+    def get_first_task_difficulty_mode(self) -> str:
+        return DEFAULT_DIFFICULTY_MODE
+
+    def normalize_difficulty_mode(self, difficulty_mode: str | None) -> str:
+        normalized = (difficulty_mode or "").strip().lower()
+        if normalized in DIFFICULTY_LADDER:
+            return normalized
+        return DEFAULT_DIFFICULTY_MODE
+
+    def infer_difficulty_mode_from_progress(self, completed_tasks_count: int) -> str:
+        if completed_tasks_count <= 0:
+            return "starter"
+        if completed_tasks_count <= 2:
+            return "base"
+        if completed_tasks_count <= 5:
+            return "growth"
+        return "pro"
+
+    def build_next_difficulty_mode(
+        self,
+        *,
+        current_difficulty_mode: str | None,
+        completed_tasks_count: int,
+        next_step_mode: str,
+    ) -> str:
+        normalized_next_step_mode = (next_step_mode or "").strip().lower()
+        fallback_mode = self.infer_difficulty_mode_from_progress(completed_tasks_count)
+
+        current_mode = self.normalize_difficulty_mode(current_difficulty_mode)
+        if current_mode not in DIFFICULTY_LADDER:
+            current_mode = fallback_mode
+
+        current_index = DIFFICULTY_LADDER.index(current_mode)
+
+        if normalized_next_step_mode == "easier":
+            return DIFFICULTY_LADDER[max(0, current_index - 1)]
+
+        if normalized_next_step_mode == "same":
+            return DIFFICULTY_LADDER[current_index]
+
+        if normalized_next_step_mode == "harder":
+            target_index = min(len(DIFFICULTY_LADDER) - 1, current_index + 1)
+            return DIFFICULTY_LADDER[target_index]
+
+        return current_mode
 
     def detect_user_state_from_text(self, text: str) -> dict | None:
         normalized = self._normalize_text(text)
@@ -467,6 +530,40 @@ async def generate_first_task_for_user(user_id: int) -> dict:
 async def get_latest_pending_task_title(user_id: int) -> str | None:
     service = MentorService()
     return await service.get_latest_pending_task_title(user_id)
+
+
+async def get_completed_tasks_count_for_user(user_id: int) -> int:
+    service = MentorService()
+    return await service.get_completed_tasks_count(user_id)
+
+
+def get_first_task_difficulty_mode() -> str:
+    service = MentorService()
+    return service.get_first_task_difficulty_mode()
+
+
+def normalize_task_difficulty_mode(difficulty_mode: str | None) -> str:
+    service = MentorService()
+    return service.normalize_difficulty_mode(difficulty_mode)
+
+
+def infer_task_difficulty_mode_from_progress(completed_tasks_count: int) -> str:
+    service = MentorService()
+    return service.infer_difficulty_mode_from_progress(completed_tasks_count)
+
+
+def build_next_task_difficulty_mode(
+    *,
+    current_difficulty_mode: str | None,
+    completed_tasks_count: int,
+    next_step_mode: str,
+) -> str:
+    service = MentorService()
+    return service.build_next_difficulty_mode(
+        current_difficulty_mode=current_difficulty_mode,
+        completed_tasks_count=completed_tasks_count,
+        next_step_mode=next_step_mode,
+    )
 
 
 def detect_user_state_from_text(text: str) -> dict | None:

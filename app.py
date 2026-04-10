@@ -203,6 +203,7 @@ async def on_startup() -> None:
             BotCommand(command="stuck", description="Я завис"),
             BotCommand(command="easier", description="Сделай проще"),
             BotCommand(command="next", description="Дальше"),
+            BotCommand(command="progress", description="Мой прогресс"),
             BotCommand(command="delete_me", description="Удалить мои данные"),
         ]
     )
