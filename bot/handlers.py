@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import random
 from datetime import datetime, timedelta
@@ -97,6 +98,18 @@ def get_display_name(user: User | None) -> str:
     return (user.first_name or "").strip()
 
 
+def get_difficulty_label(difficulty_mode: str | None) -> str:
+    normalized = normalize_task_difficulty_mode(difficulty_mode)
+
+    labels = {
+        "starter": "Ступень: очень легкий вход",
+        "base": "Ступень: базовый проход",
+        "growth": "Ступень: рабочий проход",
+        "pro": "Ступень: профессиональный проход",
+    }
+    return labels.get(normalized, labels["starter"])
+
+
 def build_action_push() -> str:
     variants = [
         "Не зависаем. Просто заходим в действие.",
@@ -107,7 +120,11 @@ def build_action_push() -> str:
     return random.choice(variants)
 
 
-def build_easier_reply(task_title: str | None, task_description: str | None) -> str:
+def build_easier_reply(
+    task_title: str | None,
+    task_description: str | None,
+    difficulty_mode: str | None = None,
+) -> str:
     if not task_title or not task_description:
         return (
             "Сейчас не вижу активный шаг.\n\n"
@@ -138,10 +155,12 @@ def build_easier_reply(task_title: str | None, task_description: str | None) -> 
                 break
 
     first_action = action_lines[0] if action_lines else None
+    difficulty_block = get_difficulty_label(difficulty_mode)
 
     if first_action:
         return (
             f"Окей. Режем мельче.\n\n"
+            f"{difficulty_block}\n\n"
             f"Текущий шаг:\n— {task_title}\n\n"
             f"Сейчас сделай только вот это:\n{first_action}\n\n"
             "Не весь шаг. Только этот кусок."
@@ -149,6 +168,7 @@ def build_easier_reply(task_title: str | None, task_description: str | None) -> 
 
     return (
         f"Окей. Режем мельче.\n\n"
+        f"{difficulty_block}\n\n"
         f"Текущий шаг:\n— {task_title}\n\n"
         "Сейчас не пытайся сделать все.\n"
         "Открой задачу, зайди в нее на 5–10 минут и добей только самый легкий кусок."
@@ -376,6 +396,7 @@ def _build_progress_text(
     direction: str | None,
     completed_tasks_count: int,
     pending_task_title: str | None,
+    pending_task_difficulty_mode: str | None,
     strengths_summary: str | None,
     repeated_signals_summary: str | None,
 ) -> str:
@@ -392,6 +413,7 @@ def _build_progress_text(
     if pending_task_title:
         lines.append("")
         lines.append(f"Текущий шаг:\n— {pending_task_title}")
+        lines.append(get_difficulty_label(pending_task_difficulty_mode))
     else:
         lines.append("")
         lines.append("Сейчас активный шаг не висит.")
@@ -509,6 +531,12 @@ def build_compact_task_text(task: dict) -> str:
 
     lines.append(f"Первый шаг:\n{task['task_title']}")
     lines.append("")
+
+    difficulty_mode = task.get("difficulty_mode")
+    if difficulty_mode:
+        lines.append(get_difficulty_label(difficulty_mode))
+        lines.append("")
+
     lines.append(task["step_description"].strip())
 
     why_text = (task.get("why_this_step") or "").strip()
@@ -798,6 +826,7 @@ async def build_user_progress_message(user_id: int) -> str | None:
             direction=user.selected_direction,
             completed_tasks_count=len(completed_tasks),
             pending_task_title=pending_task.title if pending_task else None,
+            pending_task_difficulty_mode=pending_task.difficulty_mode if pending_task else None,
             strengths_summary=profile.observed_strengths_summary if profile else None,
             repeated_signals_summary=profile.repeated_signals_summary if profile else None,
         )
@@ -1677,6 +1706,7 @@ async def cmd_easier(message: Message) -> None:
         build_easier_reply(
             task.title if task else None,
             task.description if task else None,
+            task.difficulty_mode if task else None,
         ),
     )
 
@@ -1712,7 +1742,8 @@ async def cmd_next(message: Message) -> None:
         await human_answer(
             message,
             "У нас еще висит текущий шаг.\n\n"
-            f"Вот он:\n— {current_task.title}\n\n"
+            f"Вот он:\n— {current_task.title}\n"
+            f"{get_difficulty_label(current_task.difficulty_mode)}\n\n"
             "Если уже сделал — жми /done.\n"
             "Если тяжело — жми /easier.\n"
             "Если сделал руками — можешь еще прислать фото или голосовое, я посмотрю.",
