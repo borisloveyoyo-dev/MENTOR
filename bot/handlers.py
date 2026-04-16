@@ -39,7 +39,8 @@ from services.mentor_service import (
     MentorServiceError,
     analyze_user_profile_and_save,
     build_next_task_difficulty_mode,
-    build_state_reply,
+    detect_next_request_signal,
+    detect_task_completion_signal,
     detect_user_state_from_text,
     generate_first_task_for_user,
     get_completed_tasks_count_for_user,
@@ -114,65 +115,10 @@ def build_action_push() -> str:
     variants = [
         "Не зависаем. Просто заходим в действие.",
         "Все. Хватит крутить это в голове. Начинаем делать.",
-        "Идем руками, не размышлениями.",
+        "Идем в конкретный кусок, не в размышления.",
         "Ну все, пошел рабочий дым 😏",
     ]
     return random.choice(variants)
-
-
-def build_easier_reply(
-    task_title: str | None,
-    task_description: str | None,
-    difficulty_mode: str | None = None,
-) -> str:
-    if not task_title or not task_description:
-        return (
-            "Сейчас не вижу активный шаг.\n\n"
-            "Когда будет конкретная задача, я смогу разрезать ее мельче."
-        )
-
-    action_lines: list[str] = []
-    in_how_section = False
-
-    for raw_line in task_description.splitlines():
-        line = raw_line.strip()
-
-        if not line:
-            continue
-
-        if line.lower().startswith("как сделать:"):
-            in_how_section = True
-            continue
-
-        if in_how_section:
-            if line.startswith("- "):
-                action_lines.append(line[2:].strip())
-                continue
-
-            if line.lower().startswith("что может помочь:") or line.lower().startswith(
-                "как понять, что шаг сделан:"
-            ):
-                break
-
-    first_action = action_lines[0] if action_lines else None
-    difficulty_block = get_difficulty_label(difficulty_mode)
-
-    if first_action:
-        return (
-            f"Окей. Режем мельче.\n\n"
-            f"{difficulty_block}\n\n"
-            f"Текущий шаг:\n— {task_title}\n\n"
-            f"Сейчас сделай только вот это:\n{first_action}\n\n"
-            "Не весь шаг. Только этот кусок."
-        )
-
-    return (
-        f"Окей. Режем мельче.\n\n"
-        f"{difficulty_block}\n\n"
-        f"Текущий шаг:\n— {task_title}\n\n"
-        "Сейчас не пытайся сделать все.\n"
-        "Открой задачу, зайди в нее на 5–10 минут и добей только самый легкий кусок."
-    )
 
 
 def build_review_reply(
@@ -218,7 +164,7 @@ def build_followup_after_review(
         return (
             "Хорошо.\n"
             "На это уже можно опираться.\n"
-            "Собираю следующий проход."
+            "Собираю следующий кусок."
         )
 
     if review_status == "partial":
@@ -303,7 +249,16 @@ def _split_into_profile_points(text: str | None, *, limit: int = 2) -> list[str]
         if len(cleaned) < 4:
             continue
         lowered = cleaned.lower()
-        if lowered in {"не знаю", "пока не знаю", "не понимаю", "пока не понимаю"}:
+        if lowered in {
+            "не знаю",
+            "пока не знаю",
+            "не понимаю",
+            "пока не понимаю",
+            "ничего",
+            "ничего нет",
+            "нет",
+            "не на что",
+        }:
             continue
         points.append(cleaned)
 
@@ -354,6 +309,9 @@ def _collect_profile_reflection(profile: UserProfile) -> tuple[list[str], list[s
         signals_unique.append(item)
         if len(signals_unique) >= 3:
             break
+
+    if not strengths_unique:
+        strengths_unique = signals_unique[:2]
 
     return strengths_unique, signals_unique
 
@@ -1132,7 +1090,7 @@ async def create_next_task_from_latest_context(user_id: int) -> dict:
 
     latest_submission = await get_latest_submission_for_task(latest_done_task.id)
 
-    review_summary = "Шаг закрыт пользователем через /done."
+    review_summary = "Шаг закрыт пользователем."
     strengths = ["Пользователь довел предыдущий шаг до завершения."]
     what_to_fix: list[str] = []
     next_step_mode = "harder"
@@ -1185,6 +1143,68 @@ async def delete_user_and_all_data_by_telegram_id(telegram_user_id: int) -> bool
         await session.commit()
         logger.info("user_deleted telegram_user_id=%s user_id=%s", telegram_user_id, user.id)
         return True
+
+
+async def build_direction_fit_reason(user_id: int, direction_title: str) -> str | None:
+    async with async_session_maker() as session:
+        profile_result = await session.execute(
+            select(UserProfile).where(UserProfile.user_id == user_id)
+        )
+        profile = profile_result.scalar_one_or_none()
+
+    if profile is None:
+        return None
+
+    ai_service = AIService()
+    try:
+        result = await ai_service.explain_direction_fit(
+            selected_direction=direction_title,
+            current_income_source=profile.current_income_source,
+            free_time_style=profile.free_time_style,
+            appreciation_reason=profile.appreciation_reason,
+            help_request_reason=profile.help_request_reason,
+            about_text=profile.about_text,
+        )
+        return result.fit_reason
+    except Exception:
+        logger.exception("direction_fit_reason_error user_id=%s direction=%s", user_id, direction_title)
+        return None
+
+
+async def build_ai_chat_reply(
+    *,
+    user_id: int,
+    user_message: str,
+    selected_direction: str | None,
+    task_title: str | None,
+    task_description: str | None,
+) -> str | None:
+    async with async_session_maker() as session:
+        profile_result = await session.execute(
+            select(UserProfile).where(UserProfile.user_id == user_id)
+        )
+        profile = profile_result.scalar_one_or_none()
+
+    if profile is None:
+        return None
+
+    ai_service = AIService()
+    try:
+        result = await ai_service.generate_chat_reply(
+            selected_direction=selected_direction,
+            task_title=task_title,
+            task_description=task_description,
+            user_message=user_message,
+            current_income_source=profile.current_income_source,
+            free_time_style=profile.free_time_style,
+            appreciation_reason=profile.appreciation_reason,
+            help_request_reason=profile.help_request_reason,
+            about_text=profile.about_text,
+        )
+        return result.reply
+    except Exception:
+        logger.exception("chat_reply_generation_error user_id=%s", user_id)
+        return None
 
 
 async def show_or_generate_directions(message: Message, user: User) -> None:
@@ -1313,7 +1333,7 @@ async def handle_task_submission_photo(message: Message, user: User) -> bool:
         await send_optional_sticker(message, "error_soft")
         await human_answer(
             message,
-            "Я сейчас споткнулся на проверке фото.\n\nПопробуй еще раз чуть позже.",
+            "Я сейчас споткнулся на проверке фото.\n\nПопробуй прислать еще раз чуть позже.",
         )
         return True
 
@@ -1356,47 +1376,6 @@ async def handle_task_submission_photo(message: Message, user: User) -> bool:
     if await should_require_payment(user.id):
         await send_payment_required_message(message, user.id)
         return True
-
-    try:
-        async with ChatActionSender(
-            bot=message.bot,
-            chat_id=message.chat.id,
-            action=ChatAction.TYPING,
-        ):
-            await asyncio.sleep(random.uniform(3.0, 5.0))
-            next_task = await create_next_task_for_user(
-                user_id=user.id,
-                selected_direction=user.selected_direction,
-                current_task_title=current_task.title,
-                current_task_description=current_task.description,
-                review_summary=review.summary,
-                strengths=review.strengths,
-                what_to_fix=review.what_to_fix,
-                next_step_mode=review.next_step_mode,
-                next_step_hint=review.next_step_hint,
-                current_difficulty_mode=normalize_task_difficulty_mode(current_task.difficulty_mode),
-            )
-
-        await send_optional_sticker(message, "first_step")
-        await human_answer(
-            message,
-            build_compact_task_text(next_task),
-            min_delay=1.8,
-            max_delay=3.0,
-        )
-        await human_answer(
-            message,
-            build_action_push(),
-            min_delay=1.0,
-            max_delay=1.8,
-        )
-    except Exception:
-        logger.exception("photo_review_next_task_unexpected_error user_id=%s", user.id)
-        await send_optional_sticker(message, "error_soft")
-        await human_answer(
-            message,
-            "Шаг я засчитал, но на следующем куске сейчас споткнулся.\n\nПопробуй нажать /next чуть позже.",
-        )
 
     return True
 
@@ -1461,7 +1440,7 @@ async def handle_task_submission_voice(message: Message, user: User) -> bool:
         await send_optional_sticker(message, "error_soft")
         await human_answer(
             message,
-            "Я сейчас споткнулся на проверке голосового.\n\nПопробуй еще раз чуть позже.",
+            "Я сейчас споткнулся на проверке голосового.\n\nПопробуй прислать еще раз чуть позже.",
         )
         return True
     finally:
@@ -1507,47 +1486,28 @@ async def handle_task_submission_voice(message: Message, user: User) -> bool:
         await send_payment_required_message(message, user.id)
         return True
 
-    try:
-        async with ChatActionSender(
-            bot=message.bot,
-            chat_id=message.chat.id,
-            action=ChatAction.TYPING,
-        ):
-            await asyncio.sleep(random.uniform(3.0, 5.0))
-            next_task = await create_next_task_for_user(
-                user_id=user.id,
-                selected_direction=user.selected_direction,
-                current_task_title=current_task.title,
-                current_task_description=current_task.description,
-                review_summary=review.summary,
-                strengths=review.strengths,
-                what_to_fix=review.what_to_fix,
-                next_step_mode=review.next_step_mode,
-                next_step_hint=review.next_step_hint,
-                current_difficulty_mode=normalize_task_difficulty_mode(current_task.difficulty_mode),
-            )
+    return True
 
-        await send_optional_sticker(message, "first_step")
-        await human_answer(
-            message,
-            build_compact_task_text(next_task),
-            min_delay=1.8,
-            max_delay=3.0,
-        )
-        await human_answer(
-            message,
-            build_action_push(),
-            min_delay=1.0,
-            max_delay=1.8,
-        )
-    except Exception:
-        logger.exception("voice_review_next_task_unexpected_error user_id=%s", user.id)
-        await send_optional_sticker(message, "error_soft")
-        await human_answer(
-            message,
-            "Шаг я засчитал, но на следующем куске сейчас споткнулся.\n\nПопробуй нажать /next чуть позже.",
-        )
 
+async def answer_via_ai(
+    message: Message,
+    user: User,
+    text: str,
+    *,
+    current_task: UserTask | None = None,
+) -> bool:
+    ai_reply = await build_ai_chat_reply(
+        user_id=user.id,
+        user_message=text,
+        selected_direction=user.selected_direction,
+        task_title=current_task.title if current_task else None,
+        task_description=current_task.description if current_task else None,
+    )
+
+    if not ai_reply:
+        return False
+
+    await human_answer(message, ai_reply, min_delay=0.8, max_delay=1.6)
     return True
 
 
@@ -1639,9 +1599,9 @@ async def cmd_done(message: Message) -> None:
     await send_optional_sticker(message, "progress_good")
     await human_answer(
         message,
-        "Вот, уже хорошо.\n\n"
-        f"Закрыл шаг:\n— {completed_title}\n\n"
-        "Темп не расплескивай. Когда будешь готов — жми /next.",
+        "Супер. Засчитываю этот шаг.\n\n"
+        f"Закрылось вот это:\n— {completed_title}\n\n"
+        "Если хочешь, могу собрать следующий. Напиши «дальше» или жми /next.",
     )
 
 
@@ -1673,9 +1633,20 @@ async def cmd_stuck(message: Message) -> None:
         burnout_flag=False,
     )
 
-    task_title = await get_latest_pending_task_title(user.id)
-    await send_optional_sticker(message, "burnout_soft")
-    await human_answer(message, build_state_reply("stuck", task_title))
+    current_task = await get_latest_pending_task(user.id)
+    handled = await answer_via_ai(
+        message,
+        user,
+        "Мне тяжело и я застрял. Ответь очень коротко и по-человечески. Если есть шаг — помоги зацепиться за ближайший кусок.",
+        current_task=current_task,
+    )
+    if handled:
+        return
+
+    await human_answer(
+        message,
+        "Окей. Тогда не тащи все целиком. Возьми самый легкий кусок и начни с него.",
+    )
 
 
 @router.message(Command("easier"))
@@ -1700,14 +1671,19 @@ async def cmd_easier(message: Message) -> None:
         await send_payment_required_message(message, user.id)
         return
 
-    task = await get_latest_pending_task(user.id)
+    current_task = await get_latest_pending_task(user.id)
+    handled = await answer_via_ai(
+        message,
+        user,
+        "Мне тяжело. Разрежь текущий шаг мельче и ответь очень коротко, как в чате.",
+        current_task=current_task,
+    )
+    if handled:
+        return
+
     await human_answer(
         message,
-        build_easier_reply(
-            task.title if task else None,
-            task.description if task else None,
-            task.difficulty_mode if task else None,
-        ),
+        "Окей. Тогда сейчас делай только самый легкий кусок, не весь шаг.",
     )
 
 
@@ -1739,16 +1715,20 @@ async def cmd_next(message: Message) -> None:
 
     current_task = await get_latest_pending_task(user.id)
     if current_task is not None:
+        handled = await answer_via_ai(
+            message,
+            user,
+            "Пользователь просит следующий шаг, но текущий еще не закрыт. Ответь очень коротко, по-человечески и держи его рядом с текущим шагом.",
+            current_task=current_task,
+        )
+        if handled:
+            return
+
         await human_answer(
             message,
-            "У нас еще висит текущий шаг.\n\n"
-            f"Вот он:\n— {current_task.title}\n"
-            f"{get_difficulty_label(current_task.difficulty_mode)}\n\n"
-            "Если уже сделал — жми /done.\n"
-            "Если тяжело — жми /easier.\n"
-            "Если сделал руками — можешь еще прислать фото или голосовое, я посмотрю.",
-            min_delay=1.2,
-            max_delay=2.0,
+            "У нас еще висит текущий шаг. Если уже сделал — просто напиши об этом.",
+            min_delay=1.0,
+            max_delay=1.8,
         )
         return
 
@@ -2003,7 +1983,6 @@ async def direction_choose(callback: CallbackQuery) -> None:
 
     chosen_direction = directions[index]
     chosen_title = chosen_direction["title"]
-    chosen_description = chosen_direction["description"]
 
     await save_user_selected_direction(user.id, chosen_title)
     await set_initial_followup_schedule(user.id)
@@ -2021,12 +2000,15 @@ async def direction_choose(callback: CallbackQuery) -> None:
         min_delay=1.2,
         max_delay=2.0,
     )
-    await human_callback_answer(
-        callback,
-        f"Почему это может тебе зайти:\n\n{chosen_description}",
-        min_delay=1.0,
-        max_delay=1.8,
-    )
+
+    fit_reason = await build_direction_fit_reason(user.id, chosen_title)
+    if fit_reason:
+        await human_callback_answer(
+            callback,
+            fit_reason,
+            min_delay=1.0,
+            max_delay=1.8,
+        )
 
     try:
         async with ChatActionSender(
@@ -2203,7 +2185,7 @@ async def handle_any_message(message: Message) -> None:
         if not is_meaningful_text(text):
             await human_answer(
                 message,
-                "Напиши одним сообщением, как тебя называть и в каком роде к тебе обращаться.",
+                "Напиши, как к тебе обращаться.",
             )
             return
 
@@ -2225,7 +2207,7 @@ async def handle_any_message(message: Message) -> None:
         if not is_meaningful_text(text):
             await human_answer(
                 message,
-                "Напиши коротко, сколько у тебя сейчас реально есть времени на это.",
+                "Напиши коротко, сколько у тебя сейчас свободного времени.",
             )
             return
 
@@ -2325,6 +2307,76 @@ async def handle_any_message(message: Message) -> None:
         await send_payment_required_message(message, user.id)
         return
 
+    current_task = await get_latest_pending_task(user.id)
+
+    if user.is_onboarding_completed and current_task is not None and detect_task_completion_signal(text):
+        completed_title = await mark_latest_pending_task_completed(user.id)
+        await send_optional_sticker(message, "progress_good")
+        await human_answer(
+            message,
+            "Супер. Засчитываю этот шаг.\n\n"
+            f"Закрылось вот это:\n— {completed_title or current_task.title}\n\n"
+            "Если хочешь, могу собрать следующий. Напиши «дальше» или жми /next.",
+            min_delay=1.0,
+            max_delay=1.8,
+        )
+        return
+
+    if user.is_onboarding_completed and detect_next_request_signal(text):
+        if current_task is not None:
+            handled = await answer_via_ai(
+                message,
+                user,
+                "Пользователь просит следующий шаг, но текущий еще не закрыт. Ответь очень коротко, по-человечески и держи его рядом с текущим шагом.",
+                current_task=current_task,
+            )
+            if handled:
+                return
+
+            await human_answer(
+                message,
+                "У нас еще висит текущий шаг. Если уже сделал — просто напиши об этом.",
+            )
+            return
+
+        try:
+            await human_answer(
+                message,
+                "Хорошо. Собираю следующий кусок.",
+                min_delay=1.0,
+                max_delay=1.8,
+            )
+            async with ChatActionSender(
+                bot=message.bot,
+                chat_id=message.chat.id,
+                action=ChatAction.TYPING,
+            ):
+                await asyncio.sleep(random.uniform(3.0, 5.0))
+                next_task = await create_next_task_from_latest_context(user.id)
+
+            await send_optional_sticker(message, "first_step")
+            await human_answer(
+                message,
+                build_compact_task_text(next_task),
+                min_delay=1.8,
+                max_delay=3.0,
+            )
+            await human_answer(
+                message,
+                build_action_push(),
+                min_delay=1.0,
+                max_delay=1.8,
+            )
+            return
+        except Exception:
+            logger.exception("handle_any_message_next_generation_error user_id=%s", user.id)
+            await send_optional_sticker(message, "error_soft")
+            await human_answer(
+                message,
+                "Я сейчас споткнулся на следующем шаге.\n\nПопробуй еще раз чуть позже.",
+            )
+            return
+
     if user.is_onboarding_completed:
         detected_state = detect_user_state_from_text(text)
 
@@ -2335,21 +2387,22 @@ async def handle_any_message(message: Message) -> None:
                 burnout_flag=detected_state["burnout_flag"],
             )
 
-            state_code = detected_state["state_code"]
-
-            if state_code in {"burnout", "exhausted", "overwhelmed"}:
-                await send_optional_sticker(message, "burnout_soft")
-            elif state_code in {"progress", "done", "small_progress"}:
-                await send_optional_sticker(message, "progress_small")
-            elif state_code in {"good_progress", "result"}:
-                await send_optional_sticker(message, "progress_good")
-
-            task_title = await get_latest_pending_task_title(user.id)
-            reply_text = build_state_reply(
-                state_code,
-                task_title,
+            handled = await answer_via_ai(
+                message,
+                user,
+                text,
+                current_task=current_task,
             )
-            await human_answer(message, reply_text, min_delay=1.0, max_delay=2.0)
-            return
+            if handled:
+                return
+
+    handled = await answer_via_ai(
+        message,
+        user,
+        text,
+        current_task=current_task,
+    )
+    if handled:
+        return
 
     await message.answer(DEFAULT_REPLY_TEXT)
