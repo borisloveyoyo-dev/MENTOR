@@ -272,7 +272,6 @@ class MentorService:
             "выгорел",
             "выгорела",
             "не вывожу",
-            "не вывозю",
             "не тяну",
             "сил нет",
             "без сил",
@@ -299,7 +298,6 @@ class MentorService:
             "зависла",
             "откладываю",
             "прокрастинирую",
-            "буксую",
             "не двигается",
             "выпал",
             "выпала",
@@ -321,14 +319,12 @@ class MentorService:
         progress_keywords = [
             "сделал",
             "сделала",
-            "начал",
-            "начала",
-            "продвинулся",
-            "продвинулась",
             "получилось",
             "готово",
             "закончил",
             "закончила",
+            "выполнил",
+            "выполнила",
         ]
 
         if self._contains_any(normalized, burnout_keywords):
@@ -361,6 +357,78 @@ class MentorService:
 
         return None
 
+    def detect_task_completion_signal(self, text: str) -> bool:
+        normalized = self._normalize_text(text)
+        if not normalized:
+            return False
+
+        exact_phrases = {
+            "сделал",
+            "сделала",
+            "готово",
+            "готов",
+            "готова",
+            "есть",
+            "выполнил",
+            "выполнила",
+            "закончил",
+            "закончила",
+            "сделано",
+            "получилось",
+            "ну вот",
+            "все",
+            "всё",
+            "ок сделал",
+            "ок готово",
+            "окей готово",
+        }
+
+        if normalized in exact_phrases:
+            return True
+
+        completion_keywords = [
+            "сделал",
+            "сделала",
+            "готово",
+            "выполнил",
+            "выполнила",
+            "закончил",
+            "закончила",
+            "сделано",
+            "получилось",
+            "собрал",
+            "собрала",
+            "написал",
+            "написала",
+            "скинул",
+            "скинула",
+            "купил",
+            "купила",
+            "скачал",
+            "скачала",
+            "открыл",
+            "открыла",
+        ]
+
+        return self._contains_any(normalized, completion_keywords)
+
+    def detect_next_request_signal(self, text: str) -> bool:
+        normalized = self._normalize_text(text)
+        if not normalized:
+            return False
+
+        next_keywords = [
+            "дальше",
+            "что дальше",
+            "давай дальше",
+            "следующий",
+            "следующее",
+            "next",
+            "погнали дальше",
+            "можно дальше",
+        ]
+        return self._contains_any(normalized, next_keywords)
+
     def build_state_reply(self, state_code: str, task_title: str | None) -> str:
         task_block = ""
         if task_title:
@@ -368,7 +436,7 @@ class MentorService:
 
         if state_code == "burnout":
             return (
-                "Понял. Тогда не давим.\n\n"
+                "Понял.\n\n"
                 "Сейчас задача не в том, чтобы выжать из себя максимум, а в том, чтобы не потерять контакт с движением.\n\n"
                 f"{task_block}"
                 "Сделай только самый маленький кусок на 5–10 минут. Этого достаточно для возвращения."
@@ -376,14 +444,14 @@ class MentorService:
 
         if state_code == "stuck":
             return (
-                "Окей. Значит проблема не в тебе, а в заходе в задачу.\n\n"
+                "Окей.\n\n"
                 f"{task_block}"
-                "Не тащи все сразу. Открой задачу, выбери самый легкий кусок и добей только его."
+                "Не тащи все сразу. Выбери самый легкий кусок и добей только его."
             )
 
         if state_code == "recovery":
             return (
-                "Хорошо. Значит можно спокойно возвращаться в ритм.\n\n"
+                "Хорошо.\n\n"
                 f"{task_block}"
                 "Не пытайся резко ускориться. Возьми один конкретный кусок и сделай его нормально."
             )
@@ -393,7 +461,7 @@ class MentorService:
                 "Вот, уже лучше.\n\n"
                 "Это и есть движение.\n\n"
                 f"{task_block}"
-                "Теперь не расплескай темп: следующий шаг тоже держи маленьким и конкретным."
+                "Теперь не расплескай темп: держись за следующий маленький кусок."
             )
 
         return (
@@ -433,7 +501,7 @@ class MentorService:
             lines.append(direction["description"])
             lines.append("")
 
-        lines.append("Не как приговор, а как хорошие точки входа. Посмотри, что тебе отзывается сильнее.")
+        lines.append("Не как приговор, а как точки входа. Посмотри, что тебе отзывается сильнее.")
 
         return "\n".join(lines).strip()
 
@@ -569,6 +637,16 @@ def build_next_task_difficulty_mode(
 def detect_user_state_from_text(text: str) -> dict | None:
     service = MentorService()
     return service.detect_user_state_from_text(text)
+
+
+def detect_task_completion_signal(text: str) -> bool:
+    service = MentorService()
+    return service.detect_task_completion_signal(text)
+
+
+def detect_next_request_signal(text: str) -> bool:
+    service = MentorService()
+    return service.detect_next_request_signal(text)
 
 
 def build_state_reply(state_code: str, task_title: str | None) -> str:
