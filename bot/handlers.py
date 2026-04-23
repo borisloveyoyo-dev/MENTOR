@@ -15,6 +15,7 @@ from bot.keyboards import (
     get_delete_data_confirm_keyboard,
     get_direction_choice_keyboard,
     get_payment_keyboard,
+    get_start_onboarding_keyboard,
 )
 from bot.stickers import get_random_sticker_file_id
 from bot.texts import (
@@ -68,7 +69,7 @@ SUBSCRIPTION_DAYS = 30
 SUBSCRIPTION_TARIFF_CODE = "monthly_299"
 
 DEBUG_STICKER_ADMIN_IDS = {1041899060}
-START_ANIMATION_FILE_ID = "BAACAgIAAxkBAAFHq5Np5nadvMzDASanf_bSm5vRp4su8QACIJ0AAuTEOUu0mj6XvceZYzsE"
+START_ANIMATION_FILE_ID = "CgACAgIAAxkDAAICjGnpnfVD7jxN52hwS0QovlOmkRv2AAL0kgAC0J9RSwW_voztp-_5OwQ"
 
 PAYWALL_TEXT = (
     "Ты уже вошел в движение.\n\n"
@@ -1602,13 +1603,14 @@ async def cmd_start(message: Message) -> None:
 
     await update_profile_fields(
         user_id=user.id,
-        onboarding_step="q0_name",
+        onboarding_step="start",
     )
     await send_optional_start_animation(message)
     await send_optional_sticker(message, "welcome")
     await human_answer(
         message,
         WELCOME_TEXT,
+        reply_markup=get_start_onboarding_keyboard(),
         min_delay=1.2,
         max_delay=2.4,
     )
@@ -1956,8 +1958,14 @@ async def onboarding_start(callback: CallbackQuery) -> None:
     )
 
     if callback.message is not None:
+        await callback.message.delete()
         await send_optional_sticker_callback(callback, "onboarding_start")
-        await callback.message.edit_text(ONBOARDING_NAME_TEXT)
+        await human_callback_answer(
+            callback,
+            ONBOARDING_NAME_TEXT,
+            min_delay=0.8,
+            max_delay=1.4,
+        )
 
     await callback.answer()
 
