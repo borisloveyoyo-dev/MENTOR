@@ -44,7 +44,6 @@ from services.mentor_service import (
     detect_user_state_from_text,
     generate_first_task_for_user,
     get_completed_tasks_count_for_user,
-    get_latest_pending_task_title,
     get_saved_profile_directions,
     normalize_task_difficulty_mode,
     save_user_selected_direction,
@@ -69,6 +68,7 @@ SUBSCRIPTION_DAYS = 30
 SUBSCRIPTION_TARIFF_CODE = "monthly_299"
 
 DEBUG_STICKER_ADMIN_IDS = {1041899060}
+START_ANIMATION_FILE_ID = "BAACAgIAAxkBAAFHq5Np5nadvMzDASanf_bSm5vRp4su8QACIJ0AAuTEOUu0mj6XvceZYzsE"
 
 PAYWALL_TEXT = (
     "Ты уже вошел в движение.\n\n"
@@ -76,16 +76,43 @@ PAYWALL_TEXT = (
     "Оплачивай — и идем дальше."
 )
 
+MSK_OFFSET_HOURS = 3
+FOLLOWUP_SLOTS_MSK = (11, 21)
+
 
 def utcnow() -> datetime:
     return datetime.utcnow()
 
 
-def random_next_followup_at() -> datetime:
-    return utcnow() + timedelta(
-        hours=random.randint(6, 12),
-        minutes=random.randint(0, 59),
+def to_msk(utc_dt: datetime) -> datetime:
+    return utc_dt + timedelta(hours=MSK_OFFSET_HOURS)
+
+
+def from_msk(msk_dt: datetime) -> datetime:
+    return msk_dt - timedelta(hours=MSK_OFFSET_HOURS)
+
+
+def next_followup_at_msk_window() -> datetime:
+    now_utc = utcnow()
+    now_msk = to_msk(now_utc)
+
+    for hour in FOLLOWUP_SLOTS_MSK:
+        candidate_msk = now_msk.replace(
+            hour=hour,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        if candidate_msk > now_msk:
+            return from_msk(candidate_msk)
+
+    next_day_first_slot = (now_msk + timedelta(days=1)).replace(
+        hour=FOLLOWUP_SLOTS_MSK[0],
+        minute=0,
+        second=0,
+        microsecond=0,
     )
+    return from_msk(next_day_first_slot)
 
 
 def normalize_name(text: str) -> str:
@@ -391,6 +418,26 @@ def _build_progress_text(
     return "\n".join(lines).strip()
 
 
+async def send_optional_start_animation(message: Message) -> None:
+    if not START_ANIMATION_FILE_ID:
+        logger.info("start_animation_skip_empty_file_id")
+        return
+
+    try:
+        await message.answer_animation(START_ANIMATION_FILE_ID)
+        logger.info(
+            "start_animation_sent chat_id=%s user_id=%s",
+            message.chat.id if message.chat else None,
+            message.from_user.id if message.from_user else None,
+        )
+    except Exception:
+        logger.exception(
+            "start_animation_send_failed chat_id=%s user_id=%s",
+            message.chat.id if message.chat else None,
+            message.from_user.id if message.from_user else None,
+        )
+
+
 async def send_optional_sticker(message: Message, pack_name: str) -> None:
     sticker_id = get_random_sticker_file_id(pack_name)
     if not sticker_id:
@@ -666,7 +713,7 @@ async def touch_user_activity(user_id: int) -> None:
         user.push_explanation_due_at = None
 
         if user.is_onboarding_completed and user.selected_direction:
-            user.next_followup_at = random_next_followup_at()
+            user.next_followup_at = next_followup_at_msk_window()
 
         await session.commit()
         logger.info("user_activity_touched user_id=%s", user_id)
@@ -683,7 +730,7 @@ async def set_initial_followup_schedule(user_id: int) -> None:
             return
 
         user.last_user_message_at = utcnow()
-        user.next_followup_at = random_next_followup_at()
+        user.next_followup_at = next_followup_at_msk_window()
         user.push_explanation_due_at = None
         user.updated_at = utcnow()
 
@@ -1557,6 +1604,7 @@ async def cmd_start(message: Message) -> None:
         user_id=user.id,
         onboarding_step="q0_name",
     )
+    await send_optional_start_animation(message)
     await send_optional_sticker(message, "welcome")
     await human_answer(
         message,
