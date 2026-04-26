@@ -7,8 +7,17 @@ from typing import Any
 
 import aiohttp
 from dotenv import load_dotenv
+from sqlalchemy import select
+
+from db.database import async_session_maker
+from db.models import Payment
 
 load_dotenv()
+
+
+FIRST_MONTH_PRICE_RUB = "149.00"
+FIRST_MONTH_TARIFF_CODE = "monthly_first_149"
+REGULAR_MONTHLY_TARIFF_CODE = "monthly_299"
 
 
 class PaymentServiceError(Exception):
@@ -91,6 +100,34 @@ class PaymentService:
 
         return str(value)
 
+    async def _has_successful_payment(self, user_id: int) -> bool:
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(Payment.id)
+                .where(Payment.user_id == user_id)
+                .where(Payment.status == "succeeded")
+                .limit(1)
+            )
+            return result.scalar_one_or_none() is not None
+
+    async def _resolve_payment_terms(
+        self,
+        *,
+        user_id: int,
+        amount_rub: str | int | float | Decimal,
+        tariff_code: str,
+    ) -> tuple[str, str]:
+        normalized_amount = self._normalize_amount(amount_rub)
+
+        if tariff_code != REGULAR_MONTHLY_TARIFF_CODE:
+            return normalized_amount, tariff_code
+
+        has_successful_payment = await self._has_successful_payment(user_id)
+        if has_successful_payment:
+            return normalized_amount, tariff_code
+
+        return self._normalize_amount(FIRST_MONTH_PRICE_RUB), FIRST_MONTH_TARIFF_CODE
+
     async def create_payment(
         self,
         *,
@@ -99,7 +136,11 @@ class PaymentService:
         description: str,
         tariff_code: str,
     ) -> PaymentCreateResult:
-        amount_value = self._normalize_amount(amount_rub)
+        amount_value, resolved_tariff_code = await self._resolve_payment_terms(
+            user_id=user_id,
+            amount_rub=amount_rub,
+            tariff_code=tariff_code,
+        )
 
         payload = {
             "amount": {
@@ -114,7 +155,7 @@ class PaymentService:
             "description": description,
             "metadata": {
                 "user_id": str(user_id),
-                "tariff_code": tariff_code,
+                "tariff_code": resolved_tariff_code,
             },
         }
 
