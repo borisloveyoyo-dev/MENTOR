@@ -13,6 +13,7 @@ from aiogram.types import BotCommand
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 from bot.handlers import router
+from bot.legal_handlers import router as legal_router
 from db.database import async_session_maker
 from db.models import Payment, Subscription
 from services.payment_service import (
@@ -53,6 +54,7 @@ bot = Bot(
 )
 
 dp = Dispatcher()
+dp.include_router(legal_router)
 dp.include_router(router)
 
 scheduler_service = SchedulerService(bot)
@@ -204,6 +206,11 @@ async def on_startup() -> None:
             BotCommand(command="easier", description="Сделай проще"),
             BotCommand(command="next", description="Дальше"),
             BotCommand(command="progress", description="Мой прогресс"),
+            BotCommand(command="support", description="Поддержка"),
+            BotCommand(command="refund", description="Возврат"),
+            BotCommand(command="terms", description="Соглашение"),
+            BotCommand(command="privacy", description="Конфиденциальность"),
+            BotCommand(command="payments", description="Оплата"),
             BotCommand(command="delete_me", description="Удалить мои данные"),
         ]
     )
