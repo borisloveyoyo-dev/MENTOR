@@ -97,7 +97,7 @@ def get_payment_keyboard(payment_url: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
     builder.button(
-        text="Оплатить 299 ₽",
+        text="Оплатить доступ",
         url=payment_url,
     )
     builder.button(
