@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import random
 from datetime import datetime, timedelta
 
 from aiogram import Bot
@@ -18,29 +17,52 @@ from services.milestone_service import (
 logger = logging.getLogger(__name__)
 
 SCHEDULER_POLL_SECONDS = 300
-FOLLOWUP_MIN_HOURS = 6
-FOLLOWUP_MAX_HOURS = 12
+
+MSK_OFFSET_HOURS = 3
+FOLLOWUP_SLOTS_MSK = (11, 21)
 
 RECENT_USER_ACTIVITY_HOURS = 2
 PUSH_MIN_SILENCE_HOURS = 18
 PUSH_COOLDOWN_HOURS = 48
-PUSH_EXPLANATION_DELAY_HOURS = 12
 MILESTONE_INTERVAL_DAYS = 3
+
+FOLLOWUP_QUESTION_DELAY_SECONDS = 60
+FOLLOWUP_SOFT_ENTRY_DELAY_SECONDS = 15 * 60
 
 
 def _utcnow() -> datetime:
     return datetime.utcnow()
 
 
-def _random_next_followup_time() -> datetime:
-    hours = random.randint(FOLLOWUP_MIN_HOURS, FOLLOWUP_MAX_HOURS)
-    minutes = random.randint(0, 59)
-    return _utcnow() + timedelta(hours=hours, minutes=minutes)
+def _to_msk(utc_dt: datetime) -> datetime:
+    return utc_dt + timedelta(hours=MSK_OFFSET_HOURS)
 
 
-def _random_push_explanation_time() -> datetime:
-    minutes = random.randint(0, 45)
-    return _utcnow() + timedelta(hours=PUSH_EXPLANATION_DELAY_HOURS, minutes=minutes)
+def _from_msk(msk_dt: datetime) -> datetime:
+    return msk_dt - timedelta(hours=MSK_OFFSET_HOURS)
+
+
+def _next_followup_time() -> datetime:
+    now_utc = _utcnow()
+    now_msk = _to_msk(now_utc)
+
+    for hour in FOLLOWUP_SLOTS_MSK:
+        candidate_msk = now_msk.replace(
+            hour=hour,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        if candidate_msk > now_msk:
+            return _from_msk(candidate_msk)
+
+    next_day_first_slot = (now_msk + timedelta(days=1)).replace(
+        hour=FOLLOWUP_SLOTS_MSK[0],
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    return _from_msk(next_day_first_slot)
 
 
 def _has_pending_task(user: User) -> bool:
@@ -97,103 +119,82 @@ def _should_send_milestone(user: User, profile: UserProfile | None, now: datetim
 def _build_regular_followup(user: User) -> tuple[str, str, str]:
     name = _get_user_name(user)
 
-    openers = [
-        "Ты где завис?",
-        "Ты где?",
-        "Почему завис?",
-        "Ты чего пропал?",
-        "Ну ты где там?",
-        "Куда выпал?",
+    questions = [
+        "Ты где пропала?",
+        "Ты как там?",
+        "Ты на связи?",
+        "Как у тебя с движением?",
+        "Ты где потерялась?",
     ]
 
-    second_touches = [
-        "Сделай лучше криво, чем никак.",
-        "Не шлифуй. Просто зайди обратно.",
-        "Один маленький кусок — уже нормально.",
-        "Не думай слишком долго. Зайди руками.",
-        "Хотя бы короткий заход сегодня.",
+    soft_entries = [
+        "Давай спокойно: просто вернись на 10 минут.",
+        "Можно без подвига. Один маленький заход — уже хорошо.",
+        "Не надо идеально. Нужен просто живой вход обратно.",
+        "Зайди коротко. Хоть с одного маленького куска.",
+        "Просто вернись в процесс. Без лишнего давления.",
     ]
 
-    opener = random.choice(openers)
-    second_touch = random.choice(second_touches)
+    question = questions[0]
+    soft_entry = soft_entries[0]
 
-    if name and random.random() < 0.45:
-        opener = f"{name}, {opener[0].lower() + opener[1:]}"
+    if name:
+        question = f"{name}, {question[0].lower() + question[1:]}"
 
-    return opener, second_touch, "regular_no_task"
+    return question, soft_entry, "regular_no_task"
 
 
 def _build_burnout_followup(user: User, profile: UserProfile | None) -> tuple[str, str, str]:
     name = _get_user_name(user)
     _energy_level = (profile.energy_level or "").strip().lower() if profile else ""
 
-    openers = [
-        "Как ты?",
+    questions = [
         "Ты как сейчас?",
-        "Я не давлю. Просто скажи, как ты.",
-        "Давай без рывков. Как ты сейчас?",
+        "Как ты?",
+        "Ты в порядке?",
+        "Как ты сегодня?",
     ]
 
-    support_lines = [
-        "Ты устал не от задачи, а от того, что она висит в голове и давит.",
-        "Сейчас не нужен рывок. Нужен маленький живой вход обратно.",
-        "Если тяжело, не тащи все целиком. Зацепись за самый край.",
-        "Сейчас важнее выдохнуть и вернуться маленьким шагом.",
+    soft_entries = [
+        "Без рывка. Просто можно вернуться совсем маленьким шагом.",
+        "Сейчас не нужен подвиг. Нужен тихий, живой вход обратно.",
+        "Если тяжело — не тащи всё. Возьми самый маленький кусок.",
+        "Можно мягко. Главное — не исчезать из процесса совсем.",
     ]
 
-    opener = random.choice(openers)
-    support = random.choice(support_lines)
+    question = questions[0]
+    soft_entry = soft_entries[0]
 
-    if name and random.random() < 0.45:
-        opener = f"{name}, {opener[0].lower() + opener[1:]}"
+    if name:
+        question = f"{name}, {question[0].lower() + question[1:]}"
 
-    return opener, support, "burnout_no_task"
+    return question, soft_entry, "burnout_no_task"
 
 
 def _build_push_followup(user: User) -> tuple[str, str, str]:
     name = _get_user_name(user)
 
-    openers = [
-        "Ты чего завис?",
-        "Так, ты где?",
-        "Не пропадай.",
-        "Ну-ка вернись в движение.",
+    questions = [
+        "Ты где пропала?",
+        "Ты куда выпала?",
+        "Ты ещё здесь?",
+        "Как ты там?",
     ]
 
-    second_touches = [
-        "Нужен не рывок. Нужен короткий заход.",
-        "Хотя бы 10 минут чего-то реального сегодня.",
-        "Один маленький кусок сегодня — и уже хорошо.",
-        "Сейчас не идеал нужен. Нужен вход обратно.",
+    soft_entries = [
+        "Давай просто вернёмся в движение. Хоть на 10 минут.",
+        "Не нужен идеал. Нужен один реальный кусок сегодня.",
+        "Можно коротко. Главное — снова зайти в процесс.",
+        "Хватит одного маленького шага, чтобы снова поймать темп.",
     ]
 
-    opener = random.choice(openers)
-    second_touch = random.choice(second_touches)
+    question = questions[0]
+    soft_entry = soft_entries[0]
 
-    if name and random.random() < 0.45:
-        opener = f"{name}, {opener[0].lower() + opener[1:]}"
+    if name:
+        question = f"{name}, {question[0].lower() + question[1:]}"
 
-    return opener, second_touch, "push_no_task"
-
-
-def _build_push_explanation_followup(user: User) -> tuple[str, str]:
-    name = _get_user_name(user)
-
-    openers = [
-        "Я тогда написал жестче не чтобы додавить тебя.",
-        "Прошлое сообщение было резче специально.",
-        "Я не хотел давить. Я хотел вытащить тебя из зависания.",
-    ]
-
-    opener = random.choice(openers)
-    if name and random.random() < 0.35:
-        opener = f"{name}, {opener[0].lower() + opener[1:]}"
-
-    text = (
-        f"{opener}\n\n"
-        "Тут не нужен идеальный результат. Нужен маленький реальный шаг."
-    )
-    return text, "push_explanation_no_task"
+    return question, soft_entry, "push_no_task"
 
 
 def _should_send_push_followup(user: User, profile: UserProfile | None, now: datetime) -> bool:
@@ -213,10 +214,7 @@ def _should_send_push_followup(user: User, profile: UserProfile | None, now: dat
         if user.last_push_followup_at > now - timedelta(hours=PUSH_COOLDOWN_HOURS):
             return False
 
-    if user.last_followup_type and user.last_followup_type.startswith("push_explanation"):
-        return False
-
-    return random.random() < 0.25
+    return True
 
 
 async def _send_required_sticker(bot: Bot, telegram_user_id: int, pack_name: str) -> None:
@@ -244,15 +242,43 @@ async def _send_required_sticker(bot: Bot, telegram_user_id: int, pack_name: str
         )
 
 
-async def _send_two_touch_followup(
+async def _user_replied_after(user_id: int, started_at: datetime) -> bool:
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(User.last_user_message_at).where(User.id == user_id)
+        )
+        last_user_message_at = result.scalar_one_or_none()
+
+    if last_user_message_at is None:
+        return False
+
+    return last_user_message_at > started_at
+
+
+async def _send_staged_followup_sequence(
     bot: Bot,
-    telegram_user_id: int,
-    first_text: str,
-    second_text: str,
+    user: User,
+    sticker_pack: str,
+    question_text: str,
+    soft_entry_text: str,
+    started_at: datetime,
 ) -> None:
-    await bot.send_message(telegram_user_id, first_text)
-    await asyncio.sleep(random.randint(2, 5))
-    await bot.send_message(telegram_user_id, second_text)
+    await _send_required_sticker(bot, user.telegram_user_id, sticker_pack)
+
+    await asyncio.sleep(FOLLOWUP_QUESTION_DELAY_SECONDS)
+    if await _user_replied_after(user.id, started_at):
+        logger.info("followup_sequence_stopped_after_sticker user_id=%s", user.id)
+        return
+
+    await bot.send_message(user.telegram_user_id, question_text)
+
+    await asyncio.sleep(FOLLOWUP_SOFT_ENTRY_DELAY_SECONDS)
+    if await _user_replied_after(user.id, started_at):
+        logger.info("followup_sequence_stopped_after_question user_id=%s", user.id)
+        return
+
+    await bot.send_message(user.telegram_user_id, soft_entry_text)
+    logger.info("followup_sequence_completed user_id=%s", user.id)
 
 
 async def _send_followup(
@@ -260,43 +286,47 @@ async def _send_followup(
     user: User,
     profile: UserProfile | None,
     now: datetime,
-) -> tuple[str, bool, bool]:
-    if user.push_explanation_due_at is not None and user.push_explanation_due_at <= now:
-        text, followup_type = _build_push_explanation_followup(user)
-        await bot.send_message(user.telegram_user_id, text)
-        return followup_type, False, True
-
+) -> tuple[str, bool]:
     if _is_burnout_state(profile):
-        await _send_required_sticker(bot, user.telegram_user_id, "followup_live")
-        first_text, second_text, followup_type = _build_burnout_followup(user, profile)
-        await _send_two_touch_followup(
-            bot,
-            user.telegram_user_id,
-            first_text,
-            second_text,
+        question_text, soft_entry_text, followup_type = _build_burnout_followup(user, profile)
+        asyncio.create_task(
+            _send_staged_followup_sequence(
+                bot=bot,
+                user=user,
+                sticker_pack="followup_live",
+                question_text=question_text,
+                soft_entry_text=soft_entry_text,
+                started_at=now,
+            )
         )
-        return followup_type, False, False
+        return followup_type, False
 
     if _should_send_push_followup(user, profile, now):
-        await _send_required_sticker(bot, user.telegram_user_id, "push_soft")
-        first_text, second_text, followup_type = _build_push_followup(user)
-        await _send_two_touch_followup(
-            bot,
-            user.telegram_user_id,
-            first_text,
-            second_text,
+        question_text, soft_entry_text, followup_type = _build_push_followup(user)
+        asyncio.create_task(
+            _send_staged_followup_sequence(
+                bot=bot,
+                user=user,
+                sticker_pack="push_soft",
+                question_text=question_text,
+                soft_entry_text=soft_entry_text,
+                started_at=now,
+            )
         )
-        return followup_type, True, False
+        return followup_type, True
 
-    await _send_required_sticker(bot, user.telegram_user_id, "followup_live")
-    first_text, second_text, followup_type = _build_regular_followup(user)
-    await _send_two_touch_followup(
-        bot,
-        user.telegram_user_id,
-        first_text,
-        second_text,
+    question_text, soft_entry_text, followup_type = _build_regular_followup(user)
+    asyncio.create_task(
+        _send_staged_followup_sequence(
+            bot=bot,
+            user=user,
+            sticker_pack="followup_live",
+            question_text=question_text,
+            soft_entry_text=soft_entry_text,
+            started_at=now,
+        )
     )
-    return followup_type, False, False
+    return followup_type, False
 
 
 async def _send_milestone_if_due(
@@ -365,9 +395,13 @@ async def _process_due_users(bot: Bot) -> None:
         for user in users:
             profile = user.profile
 
-            if user.last_user_message_at and user.last_user_message_at > now - timedelta(hours=RECENT_USER_ACTIVITY_HOURS):
-                user.next_followup_at = _random_next_followup_time()
+            if user.push_explanation_due_at is not None and user.push_explanation_due_at <= now:
                 user.push_explanation_due_at = None
+
+            if user.last_user_message_at and user.last_user_message_at > now - timedelta(hours=RECENT_USER_ACTIVITY_HOURS):
+                user.next_followup_at = _next_followup_time()
+                user.push_explanation_due_at = None
+                user.updated_at = now
                 continue
 
             try:
@@ -379,12 +413,16 @@ async def _process_due_users(bot: Bot) -> None:
                 )
 
                 if milestone_sent:
-                    user.next_followup_at = _random_next_followup_time()
+                    user.next_followup_at = _next_followup_time()
                     user.push_explanation_due_at = None
                     user.updated_at = now
                     continue
 
-                followup_type, is_push, is_explanation = await _send_followup(
+                if user.next_followup_at is not None and user.next_followup_at > now:
+                    user.updated_at = now
+                    continue
+
+                followup_type, is_push = await _send_followup(
                     bot,
                     user,
                     profile,
@@ -393,20 +431,18 @@ async def _process_due_users(bot: Bot) -> None:
 
                 user.last_followup_sent_at = now
                 user.last_followup_type = followup_type
-                user.next_followup_at = _random_next_followup_time()
+                user.next_followup_at = _next_followup_time()
                 user.updated_at = now
 
                 if is_push:
                     user.last_push_followup_at = now
-                    user.push_explanation_due_at = _random_push_explanation_time()
-                elif is_explanation:
-                    user.push_explanation_due_at = None
-                else:
-                    user.push_explanation_due_at = None
+
+                user.push_explanation_due_at = None
 
             except Exception:
                 logger.exception("Ошибка при отправке follow-up пользователю id=%s", user.id)
-                user.next_followup_at = _random_next_followup_time()
+                user.next_followup_at = _next_followup_time()
+                user.push_explanation_due_at = None
                 user.updated_at = now
 
         await session.commit()

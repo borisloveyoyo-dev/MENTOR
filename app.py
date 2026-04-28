@@ -13,6 +13,7 @@ from aiogram.types import BotCommand
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 from bot.handlers import router
+from bot.legal_handlers import router as legal_router
 from db.database import async_session_maker
 from db.models import Payment, Subscription
 from services.payment_service import (
@@ -43,6 +44,7 @@ APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
 APP_PORT = int(os.getenv("APP_PORT", "8000"))
 TELEGRAM_WEBHOOK_PATH = get_env_value("TELEGRAM_WEBHOOK_PATH")
 TELEGRAM_WEBHOOK_URL = get_env_value("TELEGRAM_WEBHOOK_URL")
+TELEGRAM_WEBHOOK_SECRET = get_env_value("TELEGRAM_WEBHOOK_SECRET")
 YOOKASSA_WEBHOOK_PATH = get_env_value("YOOKASSA_WEBHOOK_PATH")
 
 
@@ -52,6 +54,7 @@ bot = Bot(
 )
 
 dp = Dispatcher()
+dp.include_router(legal_router)
 dp.include_router(router)
 
 scheduler_service = SchedulerService(bot)
@@ -75,6 +78,10 @@ async def _apply_successful_payment(payment_id: str, user_id: int | None) -> Non
 
         if payment is None:
             logger.info("payment_not_found payment_id=%s", payment_id)
+            return
+
+        if payment.status == "succeeded":
+            logger.info("payment_already_processed payment_id=%s", payment_id)
             return
 
         payment.status = "succeeded"
@@ -158,7 +165,7 @@ async def yookassa_webhook(request: web.Request) -> web.Response:
                 )
                 payment = payment_result.scalar_one_or_none()
 
-                if payment is not None:
+                if payment is not None and payment.status != "succeeded":
                     payment.status = webhook_result.status or "pending"
                     await session.commit()
         elif webhook_result.event == "payment.canceled":
@@ -170,7 +177,7 @@ async def yookassa_webhook(request: web.Request) -> web.Response:
                 )
                 payment = payment_result.scalar_one_or_none()
 
-                if payment is not None:
+                if payment is not None and payment.status != "succeeded":
                     payment.status = "canceled"
                     await session.commit()
     except Exception:
@@ -189,6 +196,7 @@ async def on_startup() -> None:
     logger.info("app_startup_begin")
     logger.info("webhook_path=%s", TELEGRAM_WEBHOOK_PATH)
     logger.info("webhook_url=%s", TELEGRAM_WEBHOOK_URL)
+    logger.info("webhook_secret_enabled=%s", bool(TELEGRAM_WEBHOOK_SECRET))
     logger.info("allowed_updates=%s", allowed_updates)
 
     await bot.set_my_commands(
@@ -197,6 +205,12 @@ async def on_startup() -> None:
             BotCommand(command="stuck", description="Я завис"),
             BotCommand(command="easier", description="Сделай проще"),
             BotCommand(command="next", description="Дальше"),
+            BotCommand(command="progress", description="Мой прогресс"),
+            BotCommand(command="support", description="Поддержка"),
+            BotCommand(command="refund", description="Возврат"),
+            BotCommand(command="terms", description="Соглашение"),
+            BotCommand(command="privacy", description="Конфиденциальность"),
+            BotCommand(command="payments", description="Оплата"),
             BotCommand(command="delete_me", description="Удалить мои данные"),
         ]
     )
@@ -204,6 +218,7 @@ async def on_startup() -> None:
     await bot.set_webhook(
         url=TELEGRAM_WEBHOOK_URL,
         allowed_updates=allowed_updates,
+        secret_token=TELEGRAM_WEBHOOK_SECRET,
     )
 
     await scheduler_service.start()
@@ -233,6 +248,7 @@ def create_app() -> web.Application:
     webhook_requests_handler = SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
+        secret_token=TELEGRAM_WEBHOOK_SECRET,
     )
     webhook_requests_handler.register(app, path=TELEGRAM_WEBHOOK_PATH)
 

@@ -7,8 +7,17 @@ from typing import Any
 
 import aiohttp
 from dotenv import load_dotenv
+from sqlalchemy import select
+
+from db.database import async_session_maker
+from db.models import Payment
 
 load_dotenv()
+
+
+FIRST_MONTH_PRICE_RUB = "149.00"
+FIRST_MONTH_TARIFF_CODE = "monthly_first_149"
+REGULAR_MONTHLY_TARIFF_CODE = "monthly_299"
 
 
 class PaymentServiceError(Exception):
@@ -38,6 +47,12 @@ class PaymentWebhookResult:
 
 
 class PaymentService:
+    ALLOWED_PAYMENT_EVENTS = {
+        "payment.succeeded": "succeeded",
+        "payment.waiting_for_capture": "waiting_for_capture",
+        "payment.canceled": "canceled",
+    }
+
     def __init__(self) -> None:
         self.shop_id = os.getenv("YKASSA_SHOP_ID") or os.getenv("YOOKASSA_SHOP_ID")
         self.api_key = os.getenv("YKASSA_API_KEY") or os.getenv("YOOKASSA_API_KEY")
@@ -85,6 +100,34 @@ class PaymentService:
 
         return str(value)
 
+    async def _has_successful_payment(self, user_id: int) -> bool:
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(Payment.id)
+                .where(Payment.user_id == user_id)
+                .where(Payment.status == "succeeded")
+                .limit(1)
+            )
+            return result.scalar_one_or_none() is not None
+
+    async def _resolve_payment_terms(
+        self,
+        *,
+        user_id: int,
+        amount_rub: str | int | float | Decimal,
+        tariff_code: str,
+    ) -> tuple[str, str]:
+        normalized_amount = self._normalize_amount(amount_rub)
+
+        if tariff_code != REGULAR_MONTHLY_TARIFF_CODE:
+            return normalized_amount, tariff_code
+
+        has_successful_payment = await self._has_successful_payment(user_id)
+        if has_successful_payment:
+            return normalized_amount, tariff_code
+
+        return self._normalize_amount(FIRST_MONTH_PRICE_RUB), FIRST_MONTH_TARIFF_CODE
+
     async def create_payment(
         self,
         *,
@@ -93,7 +136,11 @@ class PaymentService:
         description: str,
         tariff_code: str,
     ) -> PaymentCreateResult:
-        amount_value = self._normalize_amount(amount_rub)
+        amount_value, resolved_tariff_code = await self._resolve_payment_terms(
+            user_id=user_id,
+            amount_rub=amount_rub,
+            tariff_code=tariff_code,
+        )
 
         payload = {
             "amount": {
@@ -108,7 +155,7 @@ class PaymentService:
             "description": description,
             "metadata": {
                 "user_id": str(user_id),
-                "tariff_code": tariff_code,
+                "tariff_code": resolved_tariff_code,
             },
         }
 
@@ -195,6 +242,9 @@ class PaymentService:
         if not event:
             raise PaymentServiceError("В webhook нет поля event")
 
+        if event not in self.ALLOWED_PAYMENT_EVENTS:
+            raise PaymentServiceError(f"Неподдерживаемое событие webhook: {event}")
+
         if not isinstance(obj, dict):
             raise PaymentServiceError("В webhook нет корректного поля object")
 
@@ -204,19 +254,40 @@ class PaymentService:
 
         payment_data = await self.get_payment(payment_id)
 
+        api_payment_id = str(payment_data.get("id") or "").strip()
+        if not api_payment_id:
+            raise PaymentServiceError("YooKassa API не вернула payment_id")
+
+        if api_payment_id != payment_id:
+            raise PaymentServiceError("payment_id в webhook не совпадает с payment_id из YooKassa API")
+
         status = str(payment_data.get("status") or "").strip()
+        expected_status = self.ALLOWED_PAYMENT_EVENTS[event]
+        if status != expected_status:
+            raise PaymentServiceError(
+                f"Статус платежа {status!r} не соответствует событию {event!r}"
+            )
+
         paid = bool(payment_data.get("paid") is True)
+
+        if event == "payment.succeeded" and not paid:
+            raise PaymentServiceError("Для payment.succeeded платеж должен быть paid=true")
+
         metadata = payment_data.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
 
         user_id_raw = metadata.get("user_id")
         tariff_code_raw = metadata.get("tariff_code")
 
         user_id: int | None = None
         if user_id_raw is not None:
-            try:
-                user_id = int(str(user_id_raw).strip())
-            except ValueError:
-                user_id = None
+            user_id_candidate = str(user_id_raw).strip()
+            if user_id_candidate:
+                try:
+                    user_id = int(user_id_candidate)
+                except ValueError:
+                    raise PaymentServiceError("metadata.user_id должен быть целым числом")
 
         tariff_code = str(tariff_code_raw).strip() if tariff_code_raw is not None else None
         if tariff_code == "":

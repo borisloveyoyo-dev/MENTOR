@@ -5,7 +5,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 def get_start_onboarding_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(
-        text="Начать",
+        text="Старт",
         callback_data="onboarding:start",
     )
     builder.adjust(1)
@@ -97,7 +97,7 @@ def get_payment_keyboard(payment_url: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
     builder.button(
-        text="Оплатить 299 ₽",
+        text="Оплатить доступ",
         url=payment_url,
     )
     builder.button(

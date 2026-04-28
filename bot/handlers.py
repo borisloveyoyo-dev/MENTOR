@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import random
 from datetime import datetime, timedelta
@@ -14,6 +15,7 @@ from bot.keyboards import (
     get_delete_data_confirm_keyboard,
     get_direction_choice_keyboard,
     get_payment_keyboard,
+    get_start_onboarding_keyboard,
 )
 from bot.stickers import get_random_sticker_file_id
 from bot.texts import (
@@ -32,16 +34,19 @@ from bot.texts import (
     WELCOME_TEXT,
 )
 from db.database import async_session_maker
-from db.models import Payment, Subscription, User, UserProfile, UserTask
+from db.models import Payment, Subscription, TaskSubmission, User, UserProfile, UserTask
 from services.ai_service import AIService, AIServiceError
 from services.mentor_service import (
     MentorServiceError,
     analyze_user_profile_and_save,
-    build_state_reply,
+    build_next_task_difficulty_mode,
+    detect_next_request_signal,
+    detect_task_completion_signal,
     detect_user_state_from_text,
     generate_first_task_for_user,
-    get_latest_pending_task_title,
+    get_completed_tasks_count_for_user,
     get_saved_profile_directions,
+    normalize_task_difficulty_mode,
     save_user_selected_direction,
 )
 from services.payment_service import PaymentServiceError, create_payment_link
@@ -64,6 +69,7 @@ SUBSCRIPTION_DAYS = 30
 SUBSCRIPTION_TARIFF_CODE = "monthly_299"
 
 DEBUG_STICKER_ADMIN_IDS = {1041899060}
+START_ANIMATION_FILE_ID = "CgACAgIAAxkDAAICp2nuaV8xsRY6WVxFRI6PlOqu5EjRAALnnAACK8FxS77NTtGVu7ZlOwQ"
 
 PAYWALL_TEXT = (
     "Ты уже вошел в движение.\n\n"
@@ -71,16 +77,43 @@ PAYWALL_TEXT = (
     "Оплачивай — и идем дальше."
 )
 
+MSK_OFFSET_HOURS = 3
+FOLLOWUP_SLOTS_MSK = (11, 21)
+
 
 def utcnow() -> datetime:
     return datetime.utcnow()
 
 
-def random_next_followup_at() -> datetime:
-    return utcnow() + timedelta(
-        hours=random.randint(6, 12),
-        minutes=random.randint(0, 59),
+def to_msk(utc_dt: datetime) -> datetime:
+    return utc_dt + timedelta(hours=MSK_OFFSET_HOURS)
+
+
+def from_msk(msk_dt: datetime) -> datetime:
+    return msk_dt - timedelta(hours=MSK_OFFSET_HOURS)
+
+
+def next_followup_at_msk_window() -> datetime:
+    now_utc = utcnow()
+    now_msk = to_msk(now_utc)
+
+    for hour in FOLLOWUP_SLOTS_MSK:
+        candidate_msk = now_msk.replace(
+            hour=hour,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        if candidate_msk > now_msk:
+            return from_msk(candidate_msk)
+
+    next_day_first_slot = (now_msk + timedelta(days=1)).replace(
+        hour=FOLLOWUP_SLOTS_MSK[0],
+        minute=0,
+        second=0,
+        microsecond=0,
     )
+    return from_msk(next_day_first_slot)
 
 
 def normalize_name(text: str) -> str:
@@ -94,62 +127,26 @@ def get_display_name(user: User | None) -> str:
     return (user.first_name or "").strip()
 
 
+def get_difficulty_label(difficulty_mode: str | None) -> str:
+    normalized = normalize_task_difficulty_mode(difficulty_mode)
+
+    labels = {
+        "starter": "Ступень: очень легкий вход",
+        "base": "Ступень: базовый проход",
+        "growth": "Ступень: рабочий проход",
+        "pro": "Ступень: профессиональный проход",
+    }
+    return labels.get(normalized, labels["starter"])
+
+
 def build_action_push() -> str:
     variants = [
         "Не зависаем. Просто заходим в действие.",
         "Все. Хватит крутить это в голове. Начинаем делать.",
-        "Идем руками, не размышлениями.",
+        "Идем в конкретный кусок, не в размышления.",
         "Ну все, пошел рабочий дым 😏",
     ]
     return random.choice(variants)
-
-
-def build_easier_reply(task_title: str | None, task_description: str | None) -> str:
-    if not task_title or not task_description:
-        return (
-            "Сейчас не вижу активный шаг.\n\n"
-            "Когда будет конкретная задача, я смогу разрезать ее мельче."
-        )
-
-    action_lines: list[str] = []
-    in_how_section = False
-
-    for raw_line in task_description.splitlines():
-        line = raw_line.strip()
-
-        if not line:
-            continue
-
-        if line.lower().startswith("как сделать:"):
-            in_how_section = True
-            continue
-
-        if in_how_section:
-            if line.startswith("- "):
-                action_lines.append(line[2:].strip())
-                continue
-
-            if line.lower().startswith("что может помочь:") or line.lower().startswith(
-                "как понять, что шаг сделан:"
-            ):
-                break
-
-    first_action = action_lines[0] if action_lines else None
-
-    if first_action:
-        return (
-            f"Окей. Режем мельче.\n\n"
-            f"Текущий шаг:\n— {task_title}\n\n"
-            f"Сейчас сделай только вот это:\n{first_action}\n\n"
-            "Не весь шаг. Только этот кусок."
-        )
-
-    return (
-        f"Окей. Режем мельче.\n\n"
-        f"Текущий шаг:\n— {task_title}\n\n"
-        "Сейчас не пытайся сделать все.\n"
-        "Открой задачу, зайди в нее на 5–10 минут и добей только самый легкий кусок."
-    )
 
 
 def build_review_reply(
@@ -195,7 +192,7 @@ def build_followup_after_review(
         return (
             "Хорошо.\n"
             "На это уже можно опираться.\n"
-            "Собираю следующий проход."
+            "Собираю следующий кусок."
         )
 
     if review_status == "partial":
@@ -205,7 +202,7 @@ def build_followup_after_review(
         )
 
     return (
-        "Слушай, ты хотя бы не завис и что-то прислал ��\n"
+        "Слушай, ты хотя бы не завис и что-то прислал 😏\n"
         "Но сам шаг нам был нужен чуть для другого.\n"
         f"Давай добьем вот это:\n{next_step_hint}"
     )
@@ -256,6 +253,190 @@ def build_sticker_debug_reply(message: Message) -> str:
         f"type: {getattr(sticker, 'type', '-')}",
     ]
     return "\n".join(parts)
+
+
+def _normalize_point_text(text: str) -> str:
+    cleaned = " ".join((text or "").strip().split())
+    return cleaned.strip(" ,.;:-")
+
+
+def _split_into_profile_points(text: str | None, *, limit: int = 2) -> list[str]:
+    if not text:
+        return []
+
+    normalized = text.replace("\n", ". ")
+    separators = ["•", ";", "—", "-", "—", "\r"]
+    for separator in separators:
+        normalized = normalized.replace(separator, ".")
+
+    raw_parts = [part.strip() for part in normalized.split(".")]
+    points: list[str] = []
+
+    for raw in raw_parts:
+        cleaned = _normalize_point_text(raw)
+        if len(cleaned) < 4:
+            continue
+        lowered = cleaned.lower()
+        if lowered in {
+            "не знаю",
+            "пока не знаю",
+            "не понимаю",
+            "пока не понимаю",
+            "ничего",
+            "ничего нет",
+            "нет",
+            "не на что",
+        }:
+            continue
+        points.append(cleaned)
+
+    unique_points: list[str] = []
+    seen: set[str] = set()
+
+    for point in points:
+        key = point.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_points.append(point)
+        if len(unique_points) >= limit:
+            break
+
+    return unique_points
+
+
+def _collect_profile_reflection(profile: UserProfile) -> tuple[list[str], list[str]]:
+    strengths: list[str] = []
+    signals: list[str] = []
+
+    strengths.extend(_split_into_profile_points(profile.help_request_reason, limit=2))
+    strengths.extend(_split_into_profile_points(profile.appreciation_reason, limit=2))
+
+    signals.extend(_split_into_profile_points(profile.free_time_style, limit=2))
+    signals.extend(_split_into_profile_points(profile.about_text, limit=2))
+    signals.extend(_split_into_profile_points(profile.current_income_source, limit=1))
+
+    strengths_unique: list[str] = []
+    strengths_seen: set[str] = set()
+    for item in strengths:
+        key = item.lower()
+        if key in strengths_seen:
+            continue
+        strengths_seen.add(key)
+        strengths_unique.append(item)
+        if len(strengths_unique) >= 3:
+            break
+
+    signals_unique: list[str] = []
+    signals_seen: set[str] = set()
+    for item in signals:
+        key = item.lower()
+        if key in signals_seen:
+            continue
+        signals_seen.add(key)
+        signals_unique.append(item)
+        if len(signals_unique) >= 3:
+            break
+
+    if not strengths_unique:
+        strengths_unique = signals_unique[:2]
+
+    return strengths_unique, signals_unique
+
+
+def _build_onboarding_reflection_text(
+    *,
+    display_name: str,
+    strengths: list[str],
+    signals: list[str],
+) -> str:
+    intro = f"{display_name}, " if display_name else ""
+
+    lines: list[str] = [
+        f"{intro}сейчас уже видно, что ты не с пустыми руками.",
+        "",
+    ]
+
+    if strengths:
+        lines.append("Вот на что в тебе уже можно опираться:")
+        for item in strengths:
+            lines.append(f"— {item}")
+        lines.append("")
+
+    if signals:
+        lines.append("И вот что у тебя повторяется в ответах:")
+        for item in signals:
+            lines.append(f"— {item}")
+        lines.append("")
+
+    lines.append(
+        "Это не приговор и не ярлык.\n"
+        "Просто база, от которой уже можно двигаться дальше."
+    )
+
+    return "\n".join(lines).strip()
+
+
+def _build_progress_text(
+    *,
+    direction: str | None,
+    completed_tasks_count: int,
+    pending_task_title: str | None,
+    pending_task_difficulty_mode: str | None,
+    strengths_summary: str | None,
+    repeated_signals_summary: str | None,
+) -> str:
+    lines: list[str] = ["Вот где ты сейчас:", ""]
+
+    if direction:
+        lines.append(f"Направление:\n— {direction}")
+    else:
+        lines.append("Направление пока не зафиксировано.")
+
+    lines.append("")
+    lines.append(f"Закрыто шагов: {completed_tasks_count}")
+
+    if pending_task_title:
+        lines.append("")
+        lines.append(f"Текущий шаг:\n— {pending_task_title}")
+        lines.append(get_difficulty_label(pending_task_difficulty_mode))
+    else:
+        lines.append("")
+        lines.append("Сейчас активный шаг не висит.")
+
+    if strengths_summary:
+        lines.append("")
+        lines.append("На что в себе уже можно опираться:")
+        lines.extend(strengths_summary.splitlines())
+
+    if repeated_signals_summary:
+        lines.append("")
+        lines.append("Что у тебя повторяется:")
+        lines.extend(repeated_signals_summary.splitlines())
+
+    lines.append("")
+    lines.append("Если хочешь двигаться дальше — жми /next.")
+    return "\n".join(lines).strip()
+
+
+async def send_optional_start_animation(message: Message) -> None:
+    if not START_ANIMATION_FILE_ID:
+        logger.info("start_animation_skip_empty_file_id")
+        return
+
+    try:
+        await message.answer_animation(START_ANIMATION_FILE_ID)
+        logger.info(
+            "start_animation_sent chat_id=%s user_id=%s",
+            message.chat.id if message.chat else None,
+            message.from_user.id if message.from_user else None,
+        )
+    except Exception:
+        logger.exception(
+            "start_animation_send_failed chat_id=%s user_id=%s",
+            message.chat.id if message.chat else None,
+            message.from_user.id if message.from_user else None,
+        )
 
 
 async def send_optional_sticker(message: Message, pack_name: str) -> None:
@@ -356,6 +537,12 @@ def build_compact_task_text(task: dict) -> str:
 
     lines.append(f"Первый шаг:\n{task['task_title']}")
     lines.append("")
+
+    difficulty_mode = task.get("difficulty_mode")
+    if difficulty_mode:
+        lines.append(get_difficulty_label(difficulty_mode))
+        lines.append("")
+
     lines.append(task["step_description"].strip())
 
     why_text = (task.get("why_this_step") or "").strip()
@@ -527,7 +714,7 @@ async def touch_user_activity(user_id: int) -> None:
         user.push_explanation_due_at = None
 
         if user.is_onboarding_completed and user.selected_direction:
-            user.next_followup_at = random_next_followup_at()
+            user.next_followup_at = next_followup_at_msk_window()
 
         await session.commit()
         logger.info("user_activity_touched user_id=%s", user_id)
@@ -544,7 +731,7 @@ async def set_initial_followup_schedule(user_id: int) -> None:
             return
 
         user.last_user_message_at = utcnow()
-        user.next_followup_at = random_next_followup_at()
+        user.next_followup_at = next_followup_at_msk_window()
         user.push_explanation_due_at = None
         user.updated_at = utcnow()
 
@@ -575,6 +762,80 @@ async def mark_onboarding_completed(user_id: int) -> None:
 
         await session.commit()
         logger.info("onboarding_completed user_id=%s", user_id)
+
+
+async def build_and_save_onboarding_reflection(user_id: int) -> str | None:
+    async with async_session_maker() as session:
+        user_result = await session.execute(
+            select(User).where(User.id == user_id)
+        )
+        user = user_result.scalar_one_or_none()
+
+        profile_result = await session.execute(
+            select(UserProfile).where(UserProfile.user_id == user_id)
+        )
+        profile = profile_result.scalar_one_or_none()
+
+        if user is None or profile is None:
+            return None
+
+        strengths, signals = _collect_profile_reflection(profile)
+
+        strengths_summary = "\n".join(f"— {item}" for item in strengths) if strengths else None
+        repeated_signals_summary = "\n".join(f"— {item}" for item in signals) if signals else None
+
+        profile.observed_strengths_summary = strengths_summary
+        profile.repeated_signals_summary = repeated_signals_summary
+        profile.updated_at = utcnow()
+
+        await session.commit()
+
+        if not strengths and not signals:
+            return None
+
+        return _build_onboarding_reflection_text(
+            display_name=get_display_name(user),
+            strengths=strengths,
+            signals=signals,
+        )
+
+
+async def build_user_progress_message(user_id: int) -> str | None:
+    async with async_session_maker() as session:
+        user_result = await session.execute(
+            select(User).where(User.id == user_id)
+        )
+        user = user_result.scalar_one_or_none()
+
+        if user is None:
+            return None
+
+        profile_result = await session.execute(
+            select(UserProfile).where(UserProfile.user_id == user_id)
+        )
+        profile = profile_result.scalar_one_or_none()
+
+        completed_result = await session.execute(
+            select(UserTask).where(UserTask.user_id == user_id).where(UserTask.status == "done")
+        )
+        completed_tasks = completed_result.scalars().all()
+
+        pending_result = await session.execute(
+            select(UserTask)
+            .where(UserTask.user_id == user_id)
+            .where(UserTask.status == "pending")
+            .order_by(UserTask.assigned_at.desc(), UserTask.id.desc())
+        )
+        pending_task = pending_result.scalars().first()
+
+        return _build_progress_text(
+            direction=user.selected_direction,
+            completed_tasks_count=len(completed_tasks),
+            pending_task_title=pending_task.title if pending_task else None,
+            pending_task_difficulty_mode=pending_task.difficulty_mode if pending_task else None,
+            strengths_summary=profile.observed_strengths_summary if profile else None,
+            repeated_signals_summary=profile.repeated_signals_summary if profile else None,
+        )
 
 
 async def has_active_subscription(user_id: int) -> bool:
@@ -614,6 +875,27 @@ async def get_latest_pending_task(user_id: int) -> UserTask | None:
             .where(UserTask.user_id == user_id)
             .where(UserTask.status == "pending")
             .order_by(UserTask.assigned_at.desc(), UserTask.id.desc())
+        )
+        return result.scalars().first()
+
+
+async def get_latest_completed_task(user_id: int) -> UserTask | None:
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(UserTask)
+            .where(UserTask.user_id == user_id)
+            .where(UserTask.status == "done")
+            .order_by(UserTask.completed_at.desc(), UserTask.id.desc())
+        )
+        return result.scalars().first()
+
+
+async def get_latest_submission_for_task(task_id: int) -> TaskSubmission | None:
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(TaskSubmission)
+            .where(TaskSubmission.task_id == task_id)
+            .order_by(TaskSubmission.created_at.desc(), TaskSubmission.id.desc())
         )
         return result.scalars().first()
 
@@ -752,6 +1034,7 @@ async def create_next_task_for_user(
     what_to_fix: list[str],
     next_step_mode: str,
     next_step_hint: str,
+    current_difficulty_mode: str | None = None,
 ) -> dict:
     async with async_session_maker() as session:
         user_result = await session.execute(
@@ -784,6 +1067,13 @@ async def create_next_task_for_user(
             about_text=profile.about_text,
         )
 
+        completed_tasks_count = await get_completed_tasks_count_for_user(user_id)
+        difficulty_mode = build_next_task_difficulty_mode(
+            current_difficulty_mode=current_difficulty_mode,
+            completed_tasks_count=completed_tasks_count,
+            next_step_mode=next_step_mode,
+        )
+
         task_description_lines: list[str] = []
         task_description_lines.append(plan.step_description)
         task_description_lines.append("")
@@ -811,12 +1101,17 @@ async def create_next_task_for_user(
             title=plan.step_title,
             description="\n".join(task_description_lines),
             status="pending",
-            difficulty_mode="normal",
+            difficulty_mode=difficulty_mode,
         )
         session.add(new_task)
         await session.commit()
 
-        logger.info("next_task_created user_id=%s task_title=%s", user_id, plan.step_title)
+        logger.info(
+            "next_task_created user_id=%s task_title=%s difficulty_mode=%s",
+            user_id,
+            plan.step_title,
+            difficulty_mode,
+        )
 
         return {
             "task_title": plan.step_title,
@@ -825,7 +1120,61 @@ async def create_next_task_for_user(
             "how_to_do_it": plan.how_to_do_it,
             "recommended_tools": plan.recommended_tools,
             "success_criteria": plan.success_criteria,
+            "difficulty_mode": difficulty_mode,
         }
+
+
+async def create_next_task_from_latest_context(user_id: int) -> dict:
+    user, profile = await get_user_and_profile_by_telegram_id(user_id)
+    if user is None or profile is None:
+        raise MentorServiceError("Не удалось найти пользователя")
+
+    if not user.selected_direction:
+        raise MentorServiceError("У пользователя пока не выбрано направление")
+
+    latest_done_task = await get_latest_completed_task(user.id)
+    if latest_done_task is None:
+        return await generate_first_task_for_user(user.id)
+
+    latest_submission = await get_latest_submission_for_task(latest_done_task.id)
+
+    review_summary = "Шаг закрыт пользователем."
+    strengths = ["Пользователь довел предыдущий шаг до завершения."]
+    what_to_fix: list[str] = []
+    next_step_mode = "harder"
+    next_step_hint = "Дай следующий шаг по той же оси навыка, чуть профессиональнее, но без перегруза."
+
+    if latest_submission is not None:
+        review_summary = latest_submission.review_summary or review_summary
+        next_step_mode = latest_submission.next_step_mode or next_step_mode
+        next_step_hint = latest_submission.next_step_hint or next_step_hint
+
+        try:
+            strengths_data = json.loads(latest_submission.strengths_json) if latest_submission.strengths_json else []
+            if isinstance(strengths_data, list):
+                strengths = [str(item).strip() for item in strengths_data if str(item).strip()]
+        except Exception:
+            pass
+
+        try:
+            fix_data = json.loads(latest_submission.what_to_fix_json) if latest_submission.what_to_fix_json else []
+            if isinstance(fix_data, list):
+                what_to_fix = [str(item).strip() for item in fix_data if str(item).strip()]
+        except Exception:
+            pass
+
+    return await create_next_task_for_user(
+        user_id=user.id,
+        selected_direction=user.selected_direction,
+        current_task_title=latest_done_task.title,
+        current_task_description=latest_done_task.description,
+        review_summary=review_summary,
+        strengths=strengths,
+        what_to_fix=what_to_fix,
+        next_step_mode=next_step_mode,
+        next_step_hint=next_step_hint,
+        current_difficulty_mode=normalize_task_difficulty_mode(latest_done_task.difficulty_mode),
+    )
 
 
 async def delete_user_and_all_data_by_telegram_id(telegram_user_id: int) -> bool:
@@ -842,6 +1191,68 @@ async def delete_user_and_all_data_by_telegram_id(telegram_user_id: int) -> bool
         await session.commit()
         logger.info("user_deleted telegram_user_id=%s user_id=%s", telegram_user_id, user.id)
         return True
+
+
+async def build_direction_fit_reason(user_id: int, direction_title: str) -> str | None:
+    async with async_session_maker() as session:
+        profile_result = await session.execute(
+            select(UserProfile).where(UserProfile.user_id == user_id)
+        )
+        profile = profile_result.scalar_one_or_none()
+
+    if profile is None:
+        return None
+
+    ai_service = AIService()
+    try:
+        result = await ai_service.explain_direction_fit(
+            selected_direction=direction_title,
+            current_income_source=profile.current_income_source,
+            free_time_style=profile.free_time_style,
+            appreciation_reason=profile.appreciation_reason,
+            help_request_reason=profile.help_request_reason,
+            about_text=profile.about_text,
+        )
+        return result.fit_reason
+    except Exception:
+        logger.exception("direction_fit_reason_error user_id=%s direction=%s", user_id, direction_title)
+        return None
+
+
+async def build_ai_chat_reply(
+    *,
+    user_id: int,
+    user_message: str,
+    selected_direction: str | None,
+    task_title: str | None,
+    task_description: str | None,
+) -> str | None:
+    async with async_session_maker() as session:
+        profile_result = await session.execute(
+            select(UserProfile).where(UserProfile.user_id == user_id)
+        )
+        profile = profile_result.scalar_one_or_none()
+
+    if profile is None:
+        return None
+
+    ai_service = AIService()
+    try:
+        result = await ai_service.generate_chat_reply(
+            selected_direction=selected_direction,
+            task_title=task_title,
+            task_description=task_description,
+            user_message=user_message,
+            current_income_source=profile.current_income_source,
+            free_time_style=profile.free_time_style,
+            appreciation_reason=profile.appreciation_reason,
+            help_request_reason=profile.help_request_reason,
+            about_text=profile.about_text,
+        )
+        return result.reply
+    except Exception:
+        logger.exception("chat_reply_generation_error user_id=%s", user_id)
+        return None
 
 
 async def show_or_generate_directions(message: Message, user: User) -> None:
@@ -970,7 +1381,7 @@ async def handle_task_submission_photo(message: Message, user: User) -> bool:
         await send_optional_sticker(message, "error_soft")
         await human_answer(
             message,
-            "Я сейчас споткнулся на проверке фото.\n\nПопробуй еще раз чуть позже.",
+            "Я сейчас споткнулся на проверке фото.\n\nПопробуй прислать еще раз чуть позже.",
         )
         return True
 
@@ -1013,46 +1424,6 @@ async def handle_task_submission_photo(message: Message, user: User) -> bool:
     if await should_require_payment(user.id):
         await send_payment_required_message(message, user.id)
         return True
-
-    try:
-        async with ChatActionSender(
-            bot=message.bot,
-            chat_id=message.chat.id,
-            action=ChatAction.TYPING,
-        ):
-            await asyncio.sleep(random.uniform(3.0, 5.0))
-            next_task = await create_next_task_for_user(
-                user_id=user.id,
-                selected_direction=user.selected_direction,
-                current_task_title=current_task.title,
-                current_task_description=current_task.description,
-                review_summary=review.summary,
-                strengths=review.strengths,
-                what_to_fix=review.what_to_fix,
-                next_step_mode=review.next_step_mode,
-                next_step_hint=review.next_step_hint,
-            )
-
-        await send_optional_sticker(message, "first_step")
-        await human_answer(
-            message,
-            build_compact_task_text(next_task),
-            min_delay=1.8,
-            max_delay=3.0,
-        )
-        await human_answer(
-            message,
-            build_action_push(),
-            min_delay=1.0,
-            max_delay=1.8,
-        )
-    except Exception:
-        logger.exception("photo_review_next_task_unexpected_error user_id=%s", user.id)
-        await send_optional_sticker(message, "error_soft")
-        await human_answer(
-            message,
-            "Шаг я засчитал, но на следующем куске сейчас споткнулся.\n\nПопробуй нажать /next чуть позже.",
-        )
 
     return True
 
@@ -1117,7 +1488,7 @@ async def handle_task_submission_voice(message: Message, user: User) -> bool:
         await send_optional_sticker(message, "error_soft")
         await human_answer(
             message,
-            "Я сейчас споткнулся на проверке голосового.\n\nПопробуй еще раз чуть позже.",
+            "Я сейчас споткнулся на проверке голосового.\n\nПопробуй прислать еще раз чуть позже.",
         )
         return True
     finally:
@@ -1163,46 +1534,28 @@ async def handle_task_submission_voice(message: Message, user: User) -> bool:
         await send_payment_required_message(message, user.id)
         return True
 
-    try:
-        async with ChatActionSender(
-            bot=message.bot,
-            chat_id=message.chat.id,
-            action=ChatAction.TYPING,
-        ):
-            await asyncio.sleep(random.uniform(3.0, 5.0))
-            next_task = await create_next_task_for_user(
-                user_id=user.id,
-                selected_direction=user.selected_direction,
-                current_task_title=current_task.title,
-                current_task_description=current_task.description,
-                review_summary=review.summary,
-                strengths=review.strengths,
-                what_to_fix=review.what_to_fix,
-                next_step_mode=review.next_step_mode,
-                next_step_hint=review.next_step_hint,
-            )
+    return True
 
-        await send_optional_sticker(message, "first_step")
-        await human_answer(
-            message,
-            build_compact_task_text(next_task),
-            min_delay=1.8,
-            max_delay=3.0,
-        )
-        await human_answer(
-            message,
-            build_action_push(),
-            min_delay=1.0,
-            max_delay=1.8,
-        )
-    except Exception:
-        logger.exception("voice_review_next_task_unexpected_error user_id=%s", user.id)
-        await send_optional_sticker(message, "error_soft")
-        await human_answer(
-            message,
-            "Шаг я засчитал, но на следующем куске сейчас споткнулся.\n\nПопробуй нажать /next чуть позже.",
-        )
 
+async def answer_via_ai(
+    message: Message,
+    user: User,
+    text: str,
+    *,
+    current_task: UserTask | None = None,
+) -> bool:
+    ai_reply = await build_ai_chat_reply(
+        user_id=user.id,
+        user_message=text,
+        selected_direction=user.selected_direction,
+        task_title=current_task.title if current_task else None,
+        task_description=current_task.description if current_task else None,
+    )
+
+    if not ai_reply:
+        return False
+
+    await human_answer(message, ai_reply, min_delay=0.8, max_delay=1.6)
     return True
 
 
@@ -1250,12 +1603,14 @@ async def cmd_start(message: Message) -> None:
 
     await update_profile_fields(
         user_id=user.id,
-        onboarding_step="q0_name",
+        onboarding_step="start",
     )
+    await send_optional_start_animation(message)
     await send_optional_sticker(message, "welcome")
     await human_answer(
         message,
         WELCOME_TEXT,
+        reply_markup=get_start_onboarding_keyboard(),
         min_delay=1.2,
         max_delay=2.4,
     )
@@ -1294,9 +1649,9 @@ async def cmd_done(message: Message) -> None:
     await send_optional_sticker(message, "progress_good")
     await human_answer(
         message,
-        "Вот, уже хорошо.\n\n"
-        f"Закрыл шаг:\n— {completed_title}\n\n"
-        "Темп не расплескивай. Когда будешь готов — жми /next.",
+        "Супер. Засчитываю этот шаг.\n\n"
+        f"Закрылось вот это:\n— {completed_title}\n\n"
+        "Если хочешь, могу собрать следующий. Напиши «дальше» или жми /next.",
     )
 
 
@@ -1328,9 +1683,20 @@ async def cmd_stuck(message: Message) -> None:
         burnout_flag=False,
     )
 
-    task_title = await get_latest_pending_task_title(user.id)
-    await send_optional_sticker(message, "burnout_soft")
-    await human_answer(message, build_state_reply("stuck", task_title))
+    current_task = await get_latest_pending_task(user.id)
+    handled = await answer_via_ai(
+        message,
+        user,
+        "Мне тяжело и я застрял. Ответь очень коротко и по-человечески. Если есть шаг — помоги зацепиться за ближайший кусок.",
+        current_task=current_task,
+    )
+    if handled:
+        return
+
+    await human_answer(
+        message,
+        "Окей. Тогда не тащи все целиком. Возьми самый легкий кусок и начни с него.",
+    )
 
 
 @router.message(Command("easier"))
@@ -1355,13 +1721,19 @@ async def cmd_easier(message: Message) -> None:
         await send_payment_required_message(message, user.id)
         return
 
-    task = await get_latest_pending_task(user.id)
+    current_task = await get_latest_pending_task(user.id)
+    handled = await answer_via_ai(
+        message,
+        user,
+        "Мне тяжело. Разрежь текущий шаг мельче и ответь очень коротко, как в чате.",
+        current_task=current_task,
+    )
+    if handled:
+        return
+
     await human_answer(
         message,
-        build_easier_reply(
-            task.title if task else None,
-            task.description if task else None,
-        ),
+        "Окей. Тогда сейчас делай только самый легкий кусок, не весь шаг.",
     )
 
 
@@ -1393,15 +1765,20 @@ async def cmd_next(message: Message) -> None:
 
     current_task = await get_latest_pending_task(user.id)
     if current_task is not None:
+        handled = await answer_via_ai(
+            message,
+            user,
+            "Пользователь просит следующий шаг, но текущий еще не закрыт. Ответь очень коротко, по-человечески и держи его рядом с текущим шагом.",
+            current_task=current_task,
+        )
+        if handled:
+            return
+
         await human_answer(
             message,
-            "У нас еще висит текущий шаг.\n\n"
-            f"Вот он:\n— {current_task.title}\n\n"
-            "Если уже сделал — жми /done.\n"
-            "Если тяжело — жми /easier.\n"
-            "Если сделал руками — можешь еще прислать фото или голосовое, я посмотрю.",
-            min_delay=1.2,
-            max_delay=2.0,
+            "У нас еще висит текущий шаг. Если уже сделал — просто напиши об этом.",
+            min_delay=1.0,
+            max_delay=1.8,
         )
         return
 
@@ -1423,7 +1800,7 @@ async def cmd_next(message: Message) -> None:
             action=ChatAction.TYPING,
         ):
             await asyncio.sleep(random.uniform(3.0, 5.0))
-            next_task = await generate_first_task_for_user(user.id)
+            next_task = await create_next_task_from_latest_context(user.id)
 
         await send_optional_sticker(message, "first_step")
         await human_answer(
@@ -1452,6 +1829,36 @@ async def cmd_next(message: Message) -> None:
             message,
             "Я сейчас споткнулся на следующем шаге.\n\nПопробуй еще раз чуть позже.",
         )
+
+
+@router.message(Command("progress"))
+async def cmd_progress(message: Message) -> None:
+    logger.info(
+        "handler_cmd_progress user_id=%s text=%r",
+        message.from_user.id if message.from_user else None,
+        message.text,
+    )
+
+    if message.from_user is None:
+        return
+
+    user, _profile = await get_user_and_profile_by_telegram_id(message.from_user.id)
+    if user is None:
+        await message.answer(DEFAULT_REPLY_TEXT)
+        return
+
+    await touch_user_activity(user.id)
+
+    progress_text = await build_user_progress_message(user.id)
+    if not progress_text:
+        await human_answer(
+            message,
+            "Я пока не собрал по тебе прогресс. Если хочешь начать — жми /start.",
+        )
+        return
+
+    await send_optional_sticker(message, "progress_small")
+    await human_answer(message, progress_text)
 
 
 @router.message(Command("delete_me"))
@@ -1551,8 +1958,14 @@ async def onboarding_start(callback: CallbackQuery) -> None:
     )
 
     if callback.message is not None:
+        await callback.message.delete()
         await send_optional_sticker_callback(callback, "onboarding_start")
-        await callback.message.edit_text(ONBOARDING_NAME_TEXT)
+        await human_callback_answer(
+            callback,
+            ONBOARDING_NAME_TEXT,
+            min_delay=0.8,
+            max_delay=1.4,
+        )
 
     await callback.answer()
 
@@ -1626,7 +2039,6 @@ async def direction_choose(callback: CallbackQuery) -> None:
 
     chosen_direction = directions[index]
     chosen_title = chosen_direction["title"]
-    chosen_description = chosen_direction["description"]
 
     await save_user_selected_direction(user.id, chosen_title)
     await set_initial_followup_schedule(user.id)
@@ -1644,12 +2056,15 @@ async def direction_choose(callback: CallbackQuery) -> None:
         min_delay=1.2,
         max_delay=2.0,
     )
-    await human_callback_answer(
-        callback,
-        f"Почему это может тебе зайти:\n\n{chosen_description}",
-        min_delay=1.0,
-        max_delay=1.8,
-    )
+
+    fit_reason = await build_direction_fit_reason(user.id, chosen_title)
+    if fit_reason:
+        await human_callback_answer(
+            callback,
+            fit_reason,
+            min_delay=1.0,
+            max_delay=1.8,
+        )
 
     try:
         async with ChatActionSender(
@@ -1826,7 +2241,7 @@ async def handle_any_message(message: Message) -> None:
         if not is_meaningful_text(text):
             await human_answer(
                 message,
-                "Напиши одним сообщением, как тебя называть и в каком роде к тебе обращаться.",
+                "Напиши, как к тебе обращаться.",
             )
             return
 
@@ -1848,7 +2263,7 @@ async def handle_any_message(message: Message) -> None:
         if not is_meaningful_text(text):
             await human_answer(
                 message,
-                "Напиши коротко, сколько у тебя сейчас реально есть времени на это.",
+                "Напиши коротко, сколько у тебя сейчас свободного времени.",
             )
             return
 
@@ -1924,7 +2339,19 @@ async def handle_any_message(message: Message) -> None:
         )
         await mark_onboarding_completed(user.id)
 
+        reflection_text = await build_and_save_onboarding_reflection(user.id)
+
         await human_answer(message, ONBOARDING_FINISH_TEXT, min_delay=1.0, max_delay=1.8)
+
+        if reflection_text:
+            await send_optional_sticker(message, "progress_small")
+            await human_answer(
+                message,
+                reflection_text,
+                min_delay=1.2,
+                max_delay=2.0,
+            )
+
         await show_or_generate_directions(message, user)
         return
 
@@ -1936,6 +2363,76 @@ async def handle_any_message(message: Message) -> None:
         await send_payment_required_message(message, user.id)
         return
 
+    current_task = await get_latest_pending_task(user.id)
+
+    if user.is_onboarding_completed and current_task is not None and detect_task_completion_signal(text):
+        completed_title = await mark_latest_pending_task_completed(user.id)
+        await send_optional_sticker(message, "progress_good")
+        await human_answer(
+            message,
+            "Супер. Засчитываю этот шаг.\n\n"
+            f"Закрылось вот это:\n— {completed_title or current_task.title}\n\n"
+            "Если хочешь, могу собрать следующий. Напиши «дальше» или жми /next.",
+            min_delay=1.0,
+            max_delay=1.8,
+        )
+        return
+
+    if user.is_onboarding_completed and detect_next_request_signal(text):
+        if current_task is not None:
+            handled = await answer_via_ai(
+                message,
+                user,
+                "Пользователь просит следующий шаг, но текущий еще не закрыт. Ответь очень коротко, по-человечески и держи его рядом с текущим шагом.",
+                current_task=current_task,
+            )
+            if handled:
+                return
+
+            await human_answer(
+                message,
+                "У нас еще висит текущий шаг. Если уже сделал — просто напиши об этом.",
+            )
+            return
+
+        try:
+            await human_answer(
+                message,
+                "Хорошо. Собираю следующий кусок.",
+                min_delay=1.0,
+                max_delay=1.8,
+            )
+            async with ChatActionSender(
+                bot=message.bot,
+                chat_id=message.chat.id,
+                action=ChatAction.TYPING,
+            ):
+                await asyncio.sleep(random.uniform(3.0, 5.0))
+                next_task = await create_next_task_from_latest_context(user.id)
+
+            await send_optional_sticker(message, "first_step")
+            await human_answer(
+                message,
+                build_compact_task_text(next_task),
+                min_delay=1.8,
+                max_delay=3.0,
+            )
+            await human_answer(
+                message,
+                build_action_push(),
+                min_delay=1.0,
+                max_delay=1.8,
+            )
+            return
+        except Exception:
+            logger.exception("handle_any_message_next_generation_error user_id=%s", user.id)
+            await send_optional_sticker(message, "error_soft")
+            await human_answer(
+                message,
+                "Я сейчас споткнулся на следующем шаге.\n\nПопробуй еще раз чуть позже.",
+            )
+            return
+
     if user.is_onboarding_completed:
         detected_state = detect_user_state_from_text(text)
 
@@ -1946,21 +2443,22 @@ async def handle_any_message(message: Message) -> None:
                 burnout_flag=detected_state["burnout_flag"],
             )
 
-            state_code = detected_state["state_code"]
-
-            if state_code in {"burnout", "exhausted", "overwhelmed"}:
-                await send_optional_sticker(message, "burnout_soft")
-            elif state_code in {"progress", "done", "small_progress"}:
-                await send_optional_sticker(message, "progress_small")
-            elif state_code in {"good_progress", "result"}:
-                await send_optional_sticker(message, "progress_good")
-
-            task_title = await get_latest_pending_task_title(user.id)
-            reply_text = build_state_reply(
-                state_code,
-                task_title,
+            handled = await answer_via_ai(
+                message,
+                user,
+                text,
+                current_task=current_task,
             )
-            await human_answer(message, reply_text, min_delay=1.0, max_delay=2.0)
-            return
+            if handled:
+                return
+
+    handled = await answer_via_ai(
+        message,
+        user,
+        text,
+        current_task=current_task,
+    )
+    if handled:
+        return
 
     await message.answer(DEFAULT_REPLY_TEXT)
